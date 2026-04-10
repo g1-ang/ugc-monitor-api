@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ugc-monitor-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: APIFY_API_TOKEN
+        sync: false
+      - key: SPREADSHEET_ID
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GOOGLE_CREDENTIALS_PATH
+        value: config/google_credentials.json
