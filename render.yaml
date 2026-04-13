@@ -9,7 +9,9 @@ services:
         sync: false
       - key: SPREADSHEET_ID
         sync: false
-      - key: GEMINI_API_KEY
+      - key: NAVER_API_URL
+        sync: false
+      - key: NAVER_API_KEY
         sync: false
       - key: GOOGLE_CREDENTIALS_PATH
         value: config/google_credentials.json
