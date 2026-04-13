@@ -146,7 +146,7 @@ def run_full_scan(post_url: str, reference_b64: str, reference_mime: str):
 
         # ── Phase 1: 댓글 수집 ──────────────────
         scan_state.update({"progress": 10, "step": "댓글 유저 수집 중..."})
-        comments = run_apify(ACTOR_COMMENTS, {"directUrls": [post_url], "resultsLimit": 500})
+        comments = run_apify(ACTOR_COMMENTS, {"directUrls": [post_url], "resultsLimit": 500, "_triggeredBy": "지원", "_project": "프롬프트 오가닉 모니터링"})
 
         user_map = {}
         for c in comments:
@@ -170,7 +170,7 @@ def run_full_scan(post_url: str, reference_b64: str, reference_mime: str):
         chunks    = [usernames[i:i+50] for i in range(0, len(usernames), 50)]
 
         for idx, chunk in enumerate(chunks):
-            p = run_apify(ACTOR_PROFILE, {"usernames": chunk, "resultsLimit": 1})
+            p = run_apify(ACTOR_PROFILE, {"usernames": chunk, "resultsLimit": 1, "_triggeredBy": "지원", "_project": "프롬프트 오가닉 모니터링"})
             profiles.extend(p)
             progress = 30 + int((idx+1) / len(chunks) * 30)
             scan_state.update({"progress": progress, "step": f"프로필 스캔 중... ({(idx+1)*50}/{len(usernames)}명)"})
