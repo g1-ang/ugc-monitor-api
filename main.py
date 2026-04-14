@@ -10,7 +10,7 @@ Render에 배포되는 백엔드 서버입니다.
   GET  /health  → 서버 상태 확인
 """
 
-import os, io, time, base64, requests
+import os, io, time, base64, csv, requests
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from PIL import Image
+from openpyxl import load_workbook
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -34,19 +35,32 @@ MY_IG_ID           = "pitapat_prompt"
 SHEET_TAB_NAME     = "ugc_users"
 
 APIFY_BASE     = "https://api.apify.com/v2"
-ACTOR_COMMENTS = "apify~instagram-comment-scraper"
 ACTOR_PROFILE  = "apify~instagram-profile-scraper"
+USERNAME_HEADERS = {"username", "user", "userid", "user_id", "아이디", "id"}
 MODEL_NAME     = "Qwen2.5-VL-32B-Instruct"
 
-PROMPT = """아래 두 이미지를 비교해주세요.
+PROMPT = """[이미지 1]은 특정 AI 프롬프트로 만든 레퍼런스 결과물입니다.
+[이미지 2]는 유저가 올린 판별 대상 게시물입니다.
 
-[이미지 1]은 레퍼런스 스타일 샘플입니다.
-[이미지 2]는 판별 대상입니다.
+배경: 이 프롬프트는 여러 유저가 자기 얼굴로 동일하게 생성하는 구조입니다.
+동일 프롬프트로 만든 이미지는 **얼굴만 다르고 장면·구도·무드가 거의 동일**합니다.
+※ 이미지 2는 프로필 사진처럼 저해상도·저화질일 수도 있습니다. 그래도 핵심 구성이 같으면 인정합니다.
 
-판별 기준:
-- 두 이미지가 비슷한 AI 생성 스타일인가?
-- 비슷한 인물 표현 방식(얼굴 비율, 피부 보정, 분위기)인가?
-- 같은 AI 프롬프트나 도구로 만들었을 가능성이 있는가?
+얼굴(인물 identity)은 무시하고, 아래 6가지 요소 중 [이미지 1]과 [이미지 2]에서 얼마나 유사한지 판단:
+1. 배경·장소 (같은 씬/공간 유형)
+2. 의상·소품 (같은 착장이나 핵심 소품)
+3. 카메라 구도/앵글 (셀피·하이앵글·거울샷 등)
+4. 조명·노출 (광원 방향, 밝기, 분위기)
+5. 색감·톤 (팔레트, 화이트밸런스)
+6. 전체적 무드/스타일
+
+판별 규칙:
+- 얼굴이 달라도 상관없음
+- 위 6가지 중 **핵심 3가지 이상**이 명확히 유사하면 YES
+  (예: 배경+구도+소품이 같으면 조명/색감이 조금 달라도 YES)
+- 저해상도 이미지여도 큰 구성이 같아 보이면 YES
+- 단순히 "AI 이미지"거나 "여성 셀카"라는 이유만으로는 NO
+- 배경과 구도 둘 다 완전히 다르면 NO
 
 반드시 YES 또는 NO 한 단어만 답하세요."""
 
@@ -171,40 +185,64 @@ def call_qwen(reference_data_uri: str, target_url: str, max_retries: int = 3) ->
 
 
 # ── 전체 스캔 파이프라인 ───────────────────────
-def run_full_scan(post_url: str, reference_data_uri: str):
+def parse_comment_file(content: bytes, filename: str) -> list[str]:
+    """xlsx 또는 csv에서 username 리스트 추출"""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == ".xlsx":
+        wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return []
+        header = [str(c).strip().lower() if c else "" for c in rows[0]]
+        col_idx = next((i for i, h in enumerate(header) if h in USERNAME_HEADERS), 0)
+        return [str(r[col_idx]).strip() for r in rows[1:] if r and r[col_idx]]
+    elif ext == ".csv":
+        text = content.decode("utf-8-sig")
+        reader = list(csv.reader(io.StringIO(text)))
+        if not reader:
+            return []
+        header = [c.strip().lower() for c in reader[0]]
+        col_idx = next((i for i, h in enumerate(header) if h in USERNAME_HEADERS), 0)
+        return [r[col_idx].strip() for r in reader[1:] if r and r[col_idx]]
+    else:
+        raise ValueError(f"지원하지 않는 파일 형식: {ext}")
+
+
+def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
+                  reference_data_uri: str, post_url: str = ""):
     global scan_state
     scan_state.update({
-        "status": "running", "progress": 5, "step": "댓글 수집 중...",
+        "status": "running", "progress": 5, "step": "댓글 파일 파싱 중...",
         "results": [], "started_at": datetime.now().isoformat(),
     })
 
     try:
         sheet = get_sheet()
 
-        # ── Phase 1: 댓글 수집 ────────────────
-        scan_state.update({"progress": 10, "step": "댓글 유저 수집 중..."})
-        comments = run_apify(ACTOR_COMMENTS, {
-            "directUrls": [post_url], "resultsLimit": 500,
-            "_triggeredBy": "지원", "_project": "프롬프트 오가닉 모니터링",
-        })
+        # ── Phase 1: 댓글 파일 파싱 & 시트 추가 ──
+        raw_usernames = parse_comment_file(comment_file_bytes, comment_filename)
+        # 본인 제외 + 중복 제거
+        seen = set()
+        usernames = []
+        for u in raw_usernames:
+            if not u or u.lower() == MY_IG_ID.lower() or u.lower() in seen:
+                continue
+            seen.add(u.lower())
+            usernames.append(u)
 
-        user_map = {}
-        for c in comments:
-            u = c.get("ownerUsername") or c.get("username") or (c.get("owner") or {}).get("username")
-            if u and u.lower() != MY_IG_ID.lower():
-                user_map[u] = c.get("postUrl") or post_url
+        scan_state.update({"progress": 15, "step": f"댓글 유저 {len(usernames)}명 확인"})
 
         existing = {r[0].strip() for r in sheet.get_all_values()[1:] if r and r[0]}
-        to_add   = {u: v for u, v in user_map.items() if u not in existing}
+        to_add   = [u for u in usernames if u not in existing]
         if to_add:
             now  = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            rows = [[u,"",now,"","","","","none","",v,""] for u, v in sorted(to_add.items())]
+            rows = [[u,"",now,"","","","","none","",post_url,""] for u in to_add]
             sheet.append_rows(rows, value_input_option="RAW")
 
-        scan_state.update({"progress": 30, "step": f"프로필 스캔 중... ({len(user_map)}명)"})
+        scan_state.update({"progress": 25, "step": f"프로필 스캔 중... ({len(usernames)}명)"})
 
         # ── Phase 2: 프로필 스캔 ──────────────
-        usernames = list(user_map.keys())
         profiles  = []
         chunks    = [usernames[i:i+50] for i in range(0, len(usernames), 50)]
 
@@ -338,17 +376,20 @@ def health():
 @app.post("/scan")
 async def start_scan(
     background_tasks: BackgroundTasks,
-    post_url: str = Form(...),
+    comment_file: UploadFile = File(...),
     reference_image: UploadFile = File(...),
+    post_url: str = Form(""),
 ):
     if scan_state["status"] == "running":
         return JSONResponse({"error": "이미 스캔이 진행 중입니다."}, status_code=409)
 
-    img_bytes = await reference_image.read()
-    ref_uri   = resize_to_data_uri(img_bytes)
+    img_bytes     = await reference_image.read()
+    ref_uri       = resize_to_data_uri(img_bytes)
+    comment_bytes = await comment_file.read()
+    filename      = comment_file.filename or ""
 
-    background_tasks.add_task(run_full_scan, post_url, ref_uri)
-    return {"status": "started", "post_url": post_url}
+    background_tasks.add_task(run_full_scan, comment_bytes, filename, ref_uri, post_url)
+    return {"status": "started", "filename": filename, "post_url": post_url}
 
 
 @app.get("/results")
