@@ -119,11 +119,21 @@ def resize_to_data_uri(raw: bytes, max_side: int = 1024) -> str:
 
 
 def video_url_to_data_uri(video_url: str) -> str | None:
-    """비디오 URL → 첫 프레임 → data URI (음원 붙은 스토리 대응)"""
+    """비디오 URL → 첫 프레임 → data URI. imageio-ffmpeg 번들 바이너리 사용"""
     try:
-        import imageio.v3 as iio
-        frame = iio.imread(video_url, index=0, plugin="pyav")
-        img = Image.fromarray(frame)
+        import subprocess
+        import imageio_ffmpeg
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        # 첫 프레임만 JPEG 파이프로 추출
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error",
+             "-i", video_url, "-frames:v", "1", "-f", "image2pipe",
+             "-vcodec", "mjpeg", "-"],
+            capture_output=True, timeout=30,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return None
+        img = Image.open(io.BytesIO(proc.stdout))
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
         img.thumbnail((1024, 1024), Image.LANCZOS)
