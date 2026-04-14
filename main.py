@@ -36,6 +36,7 @@ SHEET_TAB_NAME     = "ugc_users"
 
 APIFY_BASE     = "https://api.apify.com/v2"
 ACTOR_PROFILE  = "apify~instagram-profile-scraper"
+ACTOR_STORY    = "seemuapps~instagram-story-scraper"
 USERNAME_HEADERS = {"username", "user", "userid", "user_id", "아이디", "id"}
 MODEL_NAME     = "Qwen2.5-VL-32B-Instruct"
 
@@ -117,6 +118,32 @@ def resize_to_data_uri(raw: bytes, max_side: int = 1024) -> str:
         return f"data:image/jpeg;base64,{b64}"
 
 
+def video_url_to_data_uri(video_url: str) -> str | None:
+    """비디오 URL → 첫 프레임 → data URI (음원 붙은 스토리 대응)"""
+    try:
+        import imageio.v3 as iio
+        frame = iio.imread(video_url, index=0, plugin="pyav")
+        img = Image.fromarray(frame)
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        img.thumbnail((1024, 1024), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        return None
+
+
+def target_to_qwen_url(url: str) -> str | None:
+    """이미지면 그대로, 비디오면 첫 프레임 data URI"""
+    if not url:
+        return None
+    lower = url.lower().split("?")[0]
+    if lower.endswith((".mp4", ".mov", ".webm")):
+        return video_url_to_data_uri(url)
+    return url
+
+
 # ── Google Sheets ─────────────────────────────
 def get_sheet():
     creds = Credentials.from_service_account_file(
@@ -165,7 +192,10 @@ def run_apify(actor_id: str, run_input: dict, timeout: int = 200) -> list:
 # ── NAVER Open Models (Qwen2.5-VL) 판별 ───────
 def call_qwen(reference_data_uri: str, target_url: str, img_type: str = "feed", max_retries: int = 3) -> bool | None:
     """레퍼런스(data URI) vs 타겟(URL) 비교. img_type='profile'이면 저해상도 프롬프트"""
-    prompt = PROMPT_PROFILE if img_type == "profile" else PROMPT_FEED
+    prompt = PROMPT_PROFILE if img_type in ("profile", "story") else PROMPT_FEED
+    target = target_to_qwen_url(target_url)
+    if not target:
+        return None
     payload = {
         "model": MODEL_NAME,
         "messages": [{
@@ -175,7 +205,7 @@ def call_qwen(reference_data_uri: str, target_url: str, img_type: str = "feed", 
                 {"type": "text", "text": "[이미지 1] 레퍼런스:"},
                 {"type": "image_url", "image_url": {"url": reference_data_uri}},
                 {"type": "text", "text": "[이미지 2] 판별 대상:"},
-                {"type": "image_url", "image_url": {"url": target_url}},
+                {"type": "image_url", "image_url": {"url": target}},
             ],
         }],
         "temperature": 0.1,
@@ -282,15 +312,29 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
             if uname:
                 profile_map[uname.lower()] = p
 
+        # ── Phase 2b: 스토리 스캔 (별도 actor) ──
+        scan_state.update({"progress": 62, "step": "스토리 스캔 중..."})
+        story_map = {}  # username → list[url]
+        story_chunks = [usernames[i:i+5] for i in range(0, len(usernames), 5)]
+        for idx, chunk in enumerate(story_chunks):
+            try:
+                items = run_apify(ACTOR_STORY, {"usernames": chunk}, timeout=180)
+                for it in items:
+                    u = (it.get("username") or "").lower()
+                    stories = it.get("stories") or []
+                    urls = [s.get("mediaUrl") for s in stories[:10] if s.get("mediaUrl")]
+                    if u and urls:
+                        story_map[u] = urls
+            except Exception as e:
+                print(f"story batch {idx+1} 실패: {e}")
+            if idx < len(story_chunks) - 1:
+                time.sleep(2)
+
         # 판별 후보 구성
         candidates = []
         for uname, p in profile_map.items():
-            has_story    = p.get("hasPublicStory", False)
-            stories      = p.get("stories") or p.get("latestStories") or []
-            story_image  = ""
-            if stories and isinstance(stories, list):
-                s0 = stories[0]
-                story_image = s0.get("displayUrl") or s0.get("imageUrl") or s0.get("url", "")
+            story_urls = story_map.get(uname.lower(), [])
+            has_story  = bool(story_urls) or p.get("hasPublicStory", False)
 
             latest_posts = p.get("latestPosts") or p.get("posts") or []
             feed_items   = []
@@ -307,7 +351,7 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                 candidates.append({
                     "username":    uname,
                     "has_story":   has_story,
-                    "story_image": story_image,
+                    "story_urls":  story_urls,
                     "feed_items":  feed_items,
                     "profile_url": profile_url,
                 })
@@ -319,12 +363,12 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
         for i, user in enumerate(candidates):
             uname = user["username"]
 
-            # 판별 순서: 프사 → 스토리 → 피드 5개
+            # 판별 순서: 프사 → 스토리(여러 장) → 피드 5개
             images_to_check = []
             if user.get("profile_url"):
                 images_to_check.append(("profile", user["profile_url"], ""))
-            if user.get("has_story") and user.get("story_image"):
-                images_to_check.append(("story", user["story_image"], ""))
+            for s_url in user.get("story_urls", []):
+                images_to_check.append(("story", s_url, ""))
             for item in user.get("feed_items", []):
                 images_to_check.append(("feed", item["image_url"], item.get("post_url", "")))
 
