@@ -27,6 +27,7 @@ from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+from sentence_transformers import SentenceTransformer, util
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -256,6 +257,80 @@ def call_qwen(reference_data_uris: list, target_url: str, img_type: str = "feed"
     return None
 
 
+# ── CLIP 기반 이미지 판별 ───────────────────────
+# 타입별 threshold: 피드는 엄격, 프사/스토리는 관대 (저해상도/분할 감안)
+CLIP_THRESHOLDS = {"feed": 0.78, "profile": 0.72, "story": 0.68}
+
+_clip_model = None
+_clip_lock  = threading.Lock()
+
+def get_clip():
+    """Lazy-load CLIP 모델 (첫 호출 시 1회만)"""
+    global _clip_model
+    if _clip_model is None:
+        with _clip_lock:
+            if _clip_model is None:
+                print("🔧 CLIP 모델 로드 중...")
+                t0 = time.time()
+                _clip_model = SentenceTransformer("clip-ViT-B-32")
+                print(f"   로드 완료 ({time.time()-t0:.1f}s)")
+    return _clip_model
+
+
+def load_image_from_data_uri(uri: str) -> Image.Image | None:
+    try:
+        b64 = uri.split(",", 1)[1] if "," in uri else uri
+        img = Image.open(io.BytesIO(base64.b64decode(b64)))
+        return img.convert("RGB") if img.mode != "RGB" else img
+    except Exception as e:
+        print(f"⚠️ data URI 디코딩 실패: {e}")
+        return None
+
+
+def fetch_image_for_clip(url: str) -> Image.Image | None:
+    """URL에서 이미지 다운로드 → PIL Image. 비디오면 첫 프레임."""
+    if not url:
+        return None
+    lower = url.lower().split("?")[0]
+    if lower.endswith((".mp4", ".mov", ".webm")):
+        data_uri = video_url_to_data_uri(url)
+        return load_image_from_data_uri(data_uri) if data_uri else None
+    try:
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 200:
+            img = Image.open(io.BytesIO(r.content))
+            return img.convert("RGB") if img.mode != "RGB" else img
+    except Exception:
+        pass
+    return None
+
+
+def compute_ref_embeddings(reference_data_uris: list):
+    """레퍼런스 이미지들의 CLIP 임베딩 (스캔 시작 시 1회)"""
+    model = get_clip()
+    imgs  = [load_image_from_data_uri(u) for u in reference_data_uris]
+    imgs  = [i for i in imgs if i is not None]
+    if not imgs:
+        return None
+    return model.encode(imgs, convert_to_tensor=True, show_progress_bar=False)
+
+
+def clip_matches(ref_embs, target_url: str, img_type: str) -> bool:
+    """타겟 이미지가 레퍼런스 중 하나라도 임계값 이상 유사하면 True"""
+    target_img = fetch_image_for_clip(target_url)
+    if target_img is None:
+        return False
+    try:
+        model      = get_clip()
+        target_emb = model.encode(target_img, convert_to_tensor=True, show_progress_bar=False)
+        max_sim    = util.cos_sim(target_emb, ref_embs).max().item()
+        threshold  = CLIP_THRESHOLDS.get(img_type, 0.75)
+        return max_sim >= threshold
+    except Exception as e:
+        print(f"⚠️ CLIP 비교 실패: {e}")
+        return False
+
+
 # ── 스캔 히스토리 저장 ─────────────────────────
 def save_scan_history(post_url: str, stats: dict, confirmed: list):
     try:
@@ -406,15 +481,21 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                     "profile_url": profile_url,
                 })
 
-        scan_state.update({"progress": 65, "step": f"AI 이미지 판별 중... (0/{len(candidates)}명)"})
+        scan_state.update({"progress": 65, "step": "CLIP 모델 준비 중..."})
 
-        # ── Phase 3: Qwen 판별 (5명 병렬) ────────────────
+        # ── Phase 3: CLIP 기반 판별 (8명 병렬) ────────────
+        ref_embs = compute_ref_embeddings(reference_data_uris)
+        if ref_embs is None:
+            raise RuntimeError("레퍼런스 이미지 임베딩 실패")
+
+        scan_state.update({"progress": 66, "step": f"AI 이미지 판별 중... (0/{len(candidates)}명)"})
+
         confirmed     = []
         done_count    = 0
         done_lock     = threading.Lock()
 
         def detect_one(user):
-            """단일 유저 판별 — 매칭 시 결과 dict 반환, 아니면 None"""
+            """단일 유저 판별 — 타입별 threshold 적용"""
             images = []
             if user.get("profile_url"):
                 images.append(("profile", user["profile_url"], ""))
@@ -424,7 +505,7 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                 images.append(("feed", item["image_url"], item.get("post_url", "")))
 
             for img_type, img_url, p_url in images:
-                if call_qwen(reference_data_uris, img_url, img_type) is True:
+                if clip_matches(ref_embs, img_url, img_type):
                     return {
                         "username":    user["username"],
                         "detected_at": datetime.now().strftime("%H:%M"),
@@ -434,7 +515,7 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                     }
             return None
 
-        with ThreadPoolExecutor(max_workers=5) as pool:
+        with ThreadPoolExecutor(max_workers=8) as pool:
             futures = {pool.submit(detect_one, u): u for u in candidates}
             for future in as_completed(futures):
                 with done_lock:
