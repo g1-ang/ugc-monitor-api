@@ -49,13 +49,13 @@ ACTOR_STORY    = "seemuapps~instagram-story-scraper"
 USERNAME_HEADERS = {"username", "user", "userid", "user_id", "아이디", "id"}
 MODEL_NAME     = "Qwen2.5-VL-32B-Instruct"
 
-PROMPT_FEED = """[이미지 1]은 특정 AI 프롬프트로 만든 레퍼런스 결과물입니다.
-[이미지 2]는 유저가 올린 판별 대상 피드 게시물입니다.
+PROMPT_FEED = """앞의 여러 [레퍼런스] 이미지들은 특정 AI 프롬프트로 만든 결과물입니다.
+마지막 [판별 대상]은 유저가 올린 피드 게시물입니다.
 
 배경: 이 프롬프트는 여러 유저가 자기 얼굴로 동일하게 생성하는 구조입니다.
 동일 프롬프트로 만든 이미지는 **얼굴만 다르고 장면·구도·무드가 거의 동일**합니다.
 
-얼굴(인물 identity)은 무시하고, 아래 6가지 요소 중 [이미지 1]과 [이미지 2]에서 얼마나 유사한지 판단:
+얼굴(인물 identity)은 무시하고, 아래 6가지 요소로 판단:
 1. 배경·장소 (같은 씬/공간 유형)
 2. 의상·소품 (같은 착장이나 핵심 소품)
 3. 카메라 구도/앵글 (셀피·하이앵글·거울샷 등)
@@ -64,30 +64,31 @@ PROMPT_FEED = """[이미지 1]은 특정 AI 프롬프트로 만든 레퍼런스 
 6. 전체적 무드/스타일
 
 판별 규칙:
+- [판별 대상]이 [레퍼런스] **중 어느 하나라도** 위 6가지 중 핵심 3가지 이상 유사하면 YES
+- 모든 [레퍼런스]와 완전히 다르면 NO
 - 얼굴이 달라도 상관없음
-- 위 6가지 중 **핵심 3가지 이상**이 명확히 유사하면 YES
 - 단순히 "AI 이미지"거나 "여성 셀카"라는 이유만으로는 NO
 - 배경과 구도 둘 다 완전히 다르면 NO
 
 반드시 YES 또는 NO 한 단어만 답하세요."""
 
-PROMPT_PROFILE = """[이미지 1]은 특정 AI 프롬프트로 만든 레퍼런스 결과물입니다.
-[이미지 2]는 유저의 프로필 사진입니다 (보통 150×150 저해상도).
+PROMPT_PROFILE = """앞의 여러 [레퍼런스] 이미지들은 특정 AI 프롬프트로 만든 결과물입니다.
+마지막 [판별 대상]은 유저의 프로필 사진 또는 스토리입니다 (저해상도일 수 있음).
 
 배경: 이 프롬프트는 여러 유저가 자기 얼굴로 동일하게 생성하는 구조입니다.
 프로필 사진은 작고 크롭되어 있을 수 있지만, 핵심 구도/배경이 같으면 같은 프롬프트로 판단합니다.
 
-얼굴은 완전히 무시하고, 아래 요소가 얼마나 비슷한지만 봅니다:
+얼굴은 완전히 무시하고, 아래 요소만 봅니다:
 1. 배경·장소 (같은 씬/공간 유형)
 2. 의상 또는 소품 (있다면)
 3. 카메라 구도·앵글 (거울샷, 셀피, 하이앵글 등)
 4. 전체 분위기·무드
 
 판별 규칙:
+- [판별 대상]이 [레퍼런스] **중 어느 하나라도** 위 4가지 중 2가지 이상 유사하면 YES
+- 모든 [레퍼런스]와 완전히 다르면 NO
 - 저해상도·크롭이어도 핵심 구도·배경이 유사하면 YES
-- 위 4가지 중 **2가지 이상**이 명확히 유사하면 YES
 - "둘 다 AI 이미지" 또는 "둘 다 셀카"라는 표면적 공통점만으론 NO
-- 배경과 구도 둘 다 완전히 다르면 NO
 
 반드시 YES 또는 NO 한 단어만 답하세요."""
 
@@ -210,24 +211,21 @@ def run_apify(actor_id: str, run_input: dict, timeout: int = 200) -> list:
 
 
 # ── NAVER Open Models (Qwen2.5-VL) 판별 ───────
-def call_qwen(reference_data_uri: str, target_url: str, img_type: str = "feed", max_retries: int = 3) -> bool | None:
-    """레퍼런스(data URI) vs 타겟(URL) 비교. img_type='profile'이면 저해상도 프롬프트"""
+def call_qwen(reference_data_uris: list, target_url: str, img_type: str = "feed", max_retries: int = 3) -> bool | None:
+    """레퍼런스들(data URI 리스트) vs 타겟(URL) 비교. 한 호출로 모든 레퍼런스와 비교."""
     prompt = PROMPT_PROFILE if img_type in ("profile", "story") else PROMPT_FEED
     target = target_to_qwen_url(target_url)
     if not target:
         return None
+    content = [{"type": "text", "text": prompt}]
+    for i, ref_uri in enumerate(reference_data_uris, start=1):
+        content.append({"type": "text", "text": f"[레퍼런스 {i}]:"})
+        content.append({"type": "image_url", "image_url": {"url": ref_uri}})
+    content.append({"type": "text", "text": "[판별 대상]:"})
+    content.append({"type": "image_url", "image_url": {"url": target}})
     payload = {
         "model": MODEL_NAME,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "text", "text": "[이미지 1] 레퍼런스:"},
-                {"type": "image_url", "image_url": {"url": reference_data_uri}},
-                {"type": "text", "text": "[이미지 2] 판별 대상:"},
-                {"type": "image_url", "image_url": {"url": target}},
-            ],
-        }],
+        "messages": [{"role": "user", "content": content}],
         "temperature": 0.1,
         "max_tokens": 10,
     }
@@ -426,15 +424,14 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                 images.append(("feed", item["image_url"], item.get("post_url", "")))
 
             for img_type, img_url, p_url in images:
-                for ref_uri in reference_data_uris:
-                    if call_qwen(ref_uri, img_url, img_type) is True:
-                        return {
-                            "username":    user["username"],
-                            "detected_at": datetime.now().strftime("%H:%M"),
-                            "type":        img_type,
-                            "link":        p_url or None,
-                            "image_url":   img_url,
-                        }
+                if call_qwen(reference_data_uris, img_url, img_type) is True:
+                    return {
+                        "username":    user["username"],
+                        "detected_at": datetime.now().strftime("%H:%M"),
+                        "type":        img_type,
+                        "link":        p_url or None,
+                        "image_url":   img_url,
+                    }
             return None
 
         with ThreadPoolExecutor(max_workers=5) as pool:
