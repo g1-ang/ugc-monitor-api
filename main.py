@@ -12,6 +12,7 @@ Render에 배포되는 백엔드 서버입니다.
 
 import os, io, time, base64, csv, requests
 from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -268,7 +269,7 @@ def parse_comment_file(content: bytes, filename: str) -> list[str]:
 
 
 def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
-                  reference_data_uri: str, post_url: str = ""):
+                  reference_data_uris: list, post_url: str = ""):
     global scan_state
     scan_state.update({
         "status": "running", "progress": 5, "step": "댓글 파일 파싱 중...",
@@ -386,10 +387,13 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
             matched_link = None
 
             for img_type, img_url, p_url in images_to_check:
-                result = call_qwen(reference_data_uri, img_url, img_type)
-                if result is True:
-                    matched_type = img_type
-                    matched_link = p_url or None
+                for ref_uri in reference_data_uris:
+                    result = call_qwen(ref_uri, img_url, img_type)
+                    if result is True:
+                        matched_type = img_type
+                        matched_link = p_url or None
+                        break
+                if matched_type:
                     break
                 time.sleep(1)
 
@@ -449,19 +453,31 @@ def health():
 async def start_scan(
     background_tasks: BackgroundTasks,
     comment_file: UploadFile = File(...),
-    reference_image: UploadFile = File(...),
     post_url: str = Form(""),
+    reference_image_1: Optional[UploadFile] = File(None),
+    reference_image_2: Optional[UploadFile] = File(None),
+    reference_image_3: Optional[UploadFile] = File(None),
+    reference_image_4: Optional[UploadFile] = File(None),
+    reference_image_5: Optional[UploadFile] = File(None),
 ):
     if scan_state["status"] == "running":
         return JSONResponse({"error": "이미 스캔이 진행 중입니다."}, status_code=409)
 
-    img_bytes     = await reference_image.read()
-    ref_uri       = resize_to_data_uri(img_bytes)
+    ref_files = [f for f in [reference_image_1, reference_image_2, reference_image_3,
+                              reference_image_4, reference_image_5] if f is not None]
+    if not ref_files:
+        return JSONResponse({"error": "레퍼런스 이미지를 1장 이상 업로드해주세요."}, status_code=422)
+
+    ref_uris = []
+    for f in ref_files:
+        raw = await f.read()
+        ref_uris.append(resize_to_data_uri(raw))
+
     comment_bytes = await comment_file.read()
     filename      = comment_file.filename or ""
 
-    background_tasks.add_task(run_full_scan, comment_bytes, filename, ref_uri, post_url)
-    return {"status": "started", "filename": filename, "post_url": post_url}
+    background_tasks.add_task(run_full_scan, comment_bytes, filename, ref_uris, post_url)
+    return {"status": "started", "filename": filename, "ref_count": len(ref_uris), "post_url": post_url}
 
 
 @app.get("/results")
