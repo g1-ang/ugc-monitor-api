@@ -476,6 +476,13 @@ async def start_scan(
     comment_bytes = await comment_file.read()
     filename      = comment_file.filename or ""
 
+    # 백그라운드 작업 등록 전에 즉시 running으로 리셋 — 폴링이 먼저 돌 때 이전 done 상태를 읽지 않도록
+    scan_state.update({
+        "status": "running", "progress": 1, "step": "시작 중...",
+        "results": [], "stats": {"feed": 0, "story": 0, "profile": 0},
+        "started_at": datetime.now().isoformat(),
+    })
+
     background_tasks.add_task(run_full_scan, comment_bytes, filename, ref_uris, post_url)
     return {"status": "started", "filename": filename, "ref_count": len(ref_uris), "post_url": post_url}
 
