@@ -393,7 +393,7 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
             story_urls = story_map.get(uname.lower(), [])[:2]   # max 2
             latest_posts = p.get("latestPosts") or p.get("posts") or []
             feed_items   = []
-            for lp in latest_posts[:2]:                          # max 2
+            for lp in latest_posts[:3]:                          # max 3
                 img_url = lp.get("displayUrl") or lp.get("imageUrl") or ""
                 sc      = lp.get("shortCode") or lp.get("shortcode") or ""
                 p_url   = f"https://www.instagram.com/p/{sc}/" if sc else lp.get("url", "")
