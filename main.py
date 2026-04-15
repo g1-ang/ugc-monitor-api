@@ -10,7 +10,8 @@ Render에 배포되는 백엔드 서버입니다.
   GET  /health  → 서버 상태 확인
 """
 
-import os, io, time, base64, csv, requests
+import os, io, time, base64, csv, requests, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -238,13 +239,19 @@ def call_qwen(reference_data_uri: str, target_url: str, img_type: str = "feed", 
 
     for attempt in range(max_retries):
         try:
-            resp = requests.post(endpoint, json=payload, headers=headers, timeout=90)
+            resp = requests.post(endpoint, json=payload, headers=headers, timeout=20)
             if resp.status_code in (429, 503):
                 time.sleep(2 ** (attempt + 2))
                 continue
             resp.raise_for_status()
             answer = resp.json()["choices"][0]["message"]["content"].strip().upper()
             return "YES" in answer
+        except requests.exceptions.Timeout:
+            print(f"⚠️ Qwen 타임아웃 (시도 {attempt+1}/{max_retries}), 스킵")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+                continue
+            return None
         except Exception as e:
             print(f"⚠️ Qwen 호출 실패: {e}")
             return None
@@ -357,10 +364,15 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
             if uname:
                 profile_map[uname.lower()] = p
 
-        # ── Phase 2b: 스토리 스캔 (별도 actor) ──
-        scan_state.update({"progress": 62, "step": "스토리 스캔 중..."})
-        story_map = {}  # username → list[url]
-        story_chunks = [usernames[i:i+20] for i in range(0, len(usernames), 20)]
+        # ── Phase 2b: 스토리 스캔 (hasPublicStory 유저만) ──
+        story_users = [u for u in usernames
+                       if profile_map.get(u.lower(), {}).get("hasPublicStory", False)]
+        scan_state.update({
+            "progress": 62,
+            "step": f"스토리 스캔 중... ({len(story_users)}명 활성 스토리)",
+        })
+        story_map = {}
+        story_chunks = [story_users[i:i+20] for i in range(0, len(story_users), 20)]
         for idx, chunk in enumerate(story_chunks):
             try:
                 items = run_apify(ACTOR_STORY, {"usernames": chunk}, timeout=180)
@@ -375,27 +387,22 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
             if idx < len(story_chunks) - 1:
                 time.sleep(2)
 
-        # 판별 후보 구성
+        # 판별 후보 구성 (피드 2장, 스토리 2장으로 제한)
         candidates = []
         for uname, p in profile_map.items():
-            story_urls = story_map.get(uname.lower(), [])
-            has_story  = bool(story_urls) or p.get("hasPublicStory", False)
-
+            story_urls = story_map.get(uname.lower(), [])[:2]   # max 2
             latest_posts = p.get("latestPosts") or p.get("posts") or []
             feed_items   = []
-            for lp in latest_posts[:5]:
+            for lp in latest_posts[:2]:                          # max 2
                 img_url = lp.get("displayUrl") or lp.get("imageUrl") or ""
                 sc      = lp.get("shortCode") or lp.get("shortcode") or ""
                 p_url   = f"https://www.instagram.com/p/{sc}/" if sc else lp.get("url", "")
                 if img_url:
                     feed_items.append({"image_url": img_url, "post_url": p_url})
-
             profile_url = p.get("profilePicUrl") or p.get("profilePicUrlHD", "")
-
-            if has_story or feed_items or profile_url:
+            if story_urls or feed_items or profile_url:
                 candidates.append({
                     "username":    uname,
-                    "has_story":   has_story,
                     "story_urls":  story_urls,
                     "feed_items":  feed_items,
                     "profile_url": profile_url,
@@ -403,65 +410,66 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
 
         scan_state.update({"progress": 65, "step": f"AI 이미지 판별 중... (0/{len(candidates)}명)"})
 
-        # ── Phase 3: Qwen 판별 ────────────────
-        confirmed = []
-        for i, user in enumerate(candidates):
-            uname = user["username"]
+        # ── Phase 3: Qwen 판별 (5명 병렬) ────────────────
+        confirmed     = []
+        done_count    = 0
+        done_lock     = threading.Lock()
 
-            # 판별 순서: 프사 → 스토리(여러 장) → 피드 5개
-            images_to_check = []
+        def detect_one(user):
+            """단일 유저 판별 — 매칭 시 결과 dict 반환, 아니면 None"""
+            images = []
             if user.get("profile_url"):
-                images_to_check.append(("profile", user["profile_url"], ""))
+                images.append(("profile", user["profile_url"], ""))
             for s_url in user.get("story_urls", []):
-                images_to_check.append(("story", s_url, ""))
+                images.append(("story", s_url, ""))
             for item in user.get("feed_items", []):
-                images_to_check.append(("feed", item["image_url"], item.get("post_url", "")))
+                images.append(("feed", item["image_url"], item.get("post_url", "")))
 
-            matched_type      = None
-            matched_link      = None
-            matched_image_url = None
-
-            for img_type, img_url, p_url in images_to_check:
+            for img_type, img_url, p_url in images:
                 for ref_uri in reference_data_uris:
-                    result = call_qwen(ref_uri, img_url, img_type)
-                    if result is True:
-                        matched_type      = img_type
-                        matched_link      = p_url or None
-                        matched_image_url = img_url
-                        break
-                if matched_type:
-                    break
-                time.sleep(1)
+                    if call_qwen(ref_uri, img_url, img_type) is True:
+                        return {
+                            "username":    user["username"],
+                            "detected_at": datetime.now().strftime("%H:%M"),
+                            "type":        img_type,
+                            "link":        p_url or None,
+                            "image_url":   img_url,
+                        }
+            return None
 
-            if matched_type:
-                confirmed.append({
-                    "username":    uname,
-                    "detected_at": datetime.now().strftime("%H:%M"),
-                    "type":        matched_type,
-                    "link":        matched_link,
-                    "image_url":   matched_image_url,
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {pool.submit(detect_one, u): u for u in candidates}
+            for future in as_completed(futures):
+                with done_lock:
+                    done_count += 1
+                    n = done_count
+                result = future.result()
+                if result:
+                    confirmed.append(result)
+                scan_state.update({
+                    "progress": 65 + int(n / max(len(candidates), 1) * 30),
+                    "step": f"AI 이미지 판별 중... ({n}/{len(candidates)}명)",
                 })
 
-                # Sheets 업데이트 (ugc_users! 접두사 포함)
-                all_vals = sheet.get_all_values()
-                for row_i, row in enumerate(all_vals[1:], start=2):
-                    if row and row[0].strip().lower() == uname.lower():
-                        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        sheet.spreadsheet.values_batch_update({
-                            "valueInputOption": "RAW",
-                            "data": [
-                                {"range": sheet_range(f"G{row_i}"), "values": [["TRUE"]]},
-                                {"range": sheet_range(f"H{row_i}"), "values": [[matched_type]]},
-                                {"range": sheet_range(f"I{row_i}"), "values": [[now]]},
-                            ],
-                        })
-                        break
-
-            progress = 65 + int((i+1) / max(len(candidates), 1) * 30)
-            scan_state.update({
-                "progress": progress,
-                "step": f"AI 이미지 판별 중... ({i+1}/{len(candidates)}명)",
-            })
+        # Sheets 일괄 업데이트 (완료 후 한 번에)
+        if confirmed:
+            all_vals  = sheet.get_all_values()
+            row_index = {row[0].strip().lower(): i+2
+                         for i, row in enumerate(all_vals[1:]) if row and row[0]}
+            now_str   = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            batch     = []
+            for r in confirmed:
+                ri = row_index.get(r["username"].lower())
+                if ri:
+                    batch += [
+                        {"range": sheet_range(f"G{ri}"), "values": [["TRUE"]]},
+                        {"range": sheet_range(f"H{ri}"), "values": [[r["type"]]]},
+                        {"range": sheet_range(f"I{ri}"), "values": [[now_str]]},
+                    ]
+            if batch:
+                sheet.spreadsheet.values_batch_update(
+                    {"valueInputOption": "RAW", "data": batch}
+                )
 
         # ── 완료 ──────────────────────────────
         feed_n    = len([r for r in confirmed if r["type"] == "feed"])
