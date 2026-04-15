@@ -14,4 +14,4 @@ services:
       - key: NAVER_API_KEY
         sync: false
       - key: GOOGLE_CREDENTIALS_PATH
-        value: config/google_credentials.json
+        value: /etc/secrets/google_credentials.json
