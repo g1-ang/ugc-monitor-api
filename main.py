@@ -48,7 +48,7 @@ APIFY_BASE     = "https://api.apify.com/v2"
 ACTOR_PROFILE  = "apify~instagram-profile-scraper"
 ACTOR_STORY    = "seemuapps~instagram-story-scraper"
 USERNAME_HEADERS = {"username", "user", "userid", "user_id", "아이디", "id"}
-MODEL_NAME     = "Qwen2.5-VL-32B-Instruct"
+MODEL_NAME     = "Qwen3.5-35B-A3B"  # MoE 아키텍처 (35B 전체, 3B 활성) — 더 빠름
 
 PROMPT_FEED = """앞의 여러 [레퍼런스] 이미지들은 특정 AI 프롬프트로 만든 결과물입니다.
 마지막 [판별 대상]은 유저가 올린 피드 게시물입니다.
@@ -487,21 +487,15 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                     "profile_url": profile_url,
                 })
 
-        scan_state.update({"progress": 65, "step": "CLIP 모델 준비 중..."})
+        scan_state.update({"progress": 65, "step": f"AI 이미지 판별 중... (0/{len(candidates)}명)"})
 
-        # ── Phase 3: CLIP 기반 판별 (8명 병렬) ────────────
-        ref_embs = compute_ref_embeddings(reference_data_uris)
-        if ref_embs is None:
-            raise RuntimeError("레퍼런스 이미지 임베딩 실패")
-
-        scan_state.update({"progress": 66, "step": f"AI 이미지 판별 중... (0/{len(candidates)}명)"})
-
+        # ── Phase 3: NAVER Qwen3.5-35B-A3B (MoE) 판별 ───
         confirmed     = []
         done_count    = 0
         done_lock     = threading.Lock()
 
         def detect_one(user):
-            """단일 유저 판별 — 타입별 threshold 적용"""
+            """단일 유저 판별 — NAVER API 호출"""
             images = []
             if user.get("profile_url"):
                 images.append(("profile", user["profile_url"], ""))
@@ -511,7 +505,7 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                 images.append(("feed", item["image_url"], item.get("post_url", "")))
 
             for img_type, img_url, p_url in images:
-                if clip_matches(ref_embs, img_url, img_type):
+                if call_qwen(reference_data_uris, img_url, img_type) is True:
                     return {
                         "username":    user["username"],
                         "detected_at": datetime.now().strftime("%H:%M"),
