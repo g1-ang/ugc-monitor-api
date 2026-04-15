@@ -27,7 +27,7 @@ from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
-from sentence_transformers import SentenceTransformer, util
+# sentence_transformers / torch 는 get_clip() 안에서 lazy import (앱 시작 속도 개선)
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -262,18 +262,24 @@ def call_qwen(reference_data_uris: list, target_url: str, img_type: str = "feed"
 CLIP_THRESHOLDS = {"feed": 0.78, "profile": 0.72, "story": 0.68}
 
 _clip_model = None
+_clip_util  = None
 _clip_lock  = threading.Lock()
 
 def get_clip():
-    """Lazy-load CLIP 모델 (첫 호출 시 1회만)"""
-    global _clip_model
+    """Lazy-load CLIP 모델 + sentence_transformers 자체도 여기서 import"""
+    global _clip_model, _clip_util
     if _clip_model is None:
         with _clip_lock:
             if _clip_model is None:
-                print("🔧 CLIP 모델 로드 중...")
+                print("🔧 sentence_transformers import 중...")
                 t0 = time.time()
+                from sentence_transformers import SentenceTransformer, util
+                print(f"   import 완료 ({time.time()-t0:.1f}s)")
+                print("🔧 CLIP 모델 로드 중...")
+                t1 = time.time()
                 _clip_model = SentenceTransformer("clip-ViT-B-32")
-                print(f"   로드 완료 ({time.time()-t0:.1f}s)")
+                _clip_util  = util
+                print(f"   로드 완료 ({time.time()-t1:.1f}s)")
     return _clip_model
 
 
@@ -323,7 +329,7 @@ def clip_matches(ref_embs, target_url: str, img_type: str) -> bool:
     try:
         model      = get_clip()
         target_emb = model.encode(target_img, convert_to_tensor=True, show_progress_bar=False)
-        max_sim    = util.cos_sim(target_emb, ref_embs).max().item()
+        max_sim    = _clip_util.cos_sim(target_emb, ref_embs).max().item()
         threshold  = CLIP_THRESHOLDS.get(img_type, 0.75)
         return max_sim >= threshold
     except Exception as e:
