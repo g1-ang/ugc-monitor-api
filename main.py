@@ -326,7 +326,7 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
         # ── Phase 2b: 스토리 스캔 (별도 actor) ──
         scan_state.update({"progress": 62, "step": "스토리 스캔 중..."})
         story_map = {}  # username → list[url]
-        story_chunks = [usernames[i:i+5] for i in range(0, len(usernames), 5)]
+        story_chunks = [usernames[i:i+20] for i in range(0, len(usernames), 20)]
         for idx, chunk in enumerate(story_chunks):
             try:
                 items = run_apify(ACTOR_STORY, {"usernames": chunk}, timeout=180)
