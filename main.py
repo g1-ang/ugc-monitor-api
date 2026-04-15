@@ -16,10 +16,14 @@ from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from dotenv import load_dotenv
 from PIL import Image
 from openpyxl import load_workbook
+from pptx import Presentation
+from pptx.util import Inches, Pt, Emu
+from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -34,6 +38,7 @@ NAVER_API_URL      = os.getenv("NAVER_API_URL", "").rstrip("/")
 NAVER_API_KEY      = os.getenv("NAVER_API_KEY")
 MY_IG_ID           = "pitapat_prompt"
 SHEET_TAB_NAME     = "ugc_users"
+HISTORY_TAB_NAME   = "scan_history"
 
 APIFY_BASE     = "https://api.apify.com/v2"
 ACTOR_PROFILE  = "apify~instagram-profile-scraper"
@@ -243,6 +248,32 @@ def call_qwen(reference_data_uri: str, target_url: str, img_type: str = "feed", 
     return None
 
 
+# ── 스캔 히스토리 저장 ─────────────────────────
+def save_scan_history(post_url: str, stats: dict, confirmed: list):
+    try:
+        creds = Credentials.from_service_account_file(
+            GOOGLE_CREDENTIALS,
+            scopes=["https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"],
+        )
+        ss = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+        try:
+            ws = ss.worksheet(HISTORY_TAB_NAME)
+        except gspread.WorksheetNotFound:
+            ws = ss.add_worksheet(HISTORY_TAB_NAME, rows=1000, cols=8)
+            ws.append_row(["날짜", "게시물URL", "피드", "스토리", "프사", "총계", "유저목록"],
+                          value_input_option="RAW")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        usernames = ",".join(r["username"] for r in confirmed)
+        ws.append_row([
+            now, post_url,
+            stats.get("feed", 0), stats.get("story", 0), stats.get("profile", 0),
+            len(confirmed), usernames,
+        ], value_input_option="RAW")
+    except Exception as e:
+        print(f"⚠️ 히스토리 저장 실패: {e}")
+
+
 # ── 전체 스캔 파이프라인 ───────────────────────
 def parse_comment_file(content: bytes, filename: str) -> list[str]:
     """xlsx 또는 csv에서 username 리스트 추출"""
@@ -383,15 +414,17 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
             for item in user.get("feed_items", []):
                 images_to_check.append(("feed", item["image_url"], item.get("post_url", "")))
 
-            matched_type = None
-            matched_link = None
+            matched_type      = None
+            matched_link      = None
+            matched_image_url = None
 
             for img_type, img_url, p_url in images_to_check:
                 for ref_uri in reference_data_uris:
                     result = call_qwen(ref_uri, img_url, img_type)
                     if result is True:
-                        matched_type = img_type
-                        matched_link = p_url or None
+                        matched_type      = img_type
+                        matched_link      = p_url or None
+                        matched_image_url = img_url
                         break
                 if matched_type:
                     break
@@ -403,6 +436,7 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                     "detected_at": datetime.now().strftime("%H:%M"),
                     "type":        matched_type,
                     "link":        matched_link,
+                    "image_url":   matched_image_url,
                 })
 
                 # Sheets 업데이트 (ugc_users! 접두사 포함)
@@ -430,13 +464,16 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
         feed_n    = len([r for r in confirmed if r["type"] == "feed"])
         story_n   = len([r for r in confirmed if r["type"] == "story"])
         profile_n = len([r for r in confirmed if r["type"] == "profile"])
+        stats_final = {"feed": feed_n, "story": story_n, "profile": profile_n}
+
+        save_scan_history(post_url, stats_final, confirmed)
 
         scan_state.update({
             "status":   "done",
             "progress": 100,
             "step":     "완료!",
             "results":  confirmed,
-            "stats":    {"feed": feed_n, "story": story_n, "profile": profile_n},
+            "stats":    stats_final,
         })
 
     except Exception as e:
@@ -490,6 +527,178 @@ async def start_scan(
 @app.get("/results")
 def get_results():
     return scan_state
+
+
+@app.get("/history")
+def get_history():
+    try:
+        creds = Credentials.from_service_account_file(
+            GOOGLE_CREDENTIALS,
+            scopes=["https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"],
+        )
+        ss = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+        try:
+            ws = ss.worksheet(HISTORY_TAB_NAME)
+        except gspread.WorksheetNotFound:
+            return {"history": []}
+        rows = ws.get_all_values()
+        if len(rows) <= 1:
+            return {"history": []}
+        keys = rows[0]
+        return {"history": [dict(zip(keys, r)) for r in rows[1:]]}
+    except Exception as e:
+        return {"history": [], "error": str(e)}
+
+
+@app.get("/export/pptx")
+def export_pptx():
+    results = scan_state.get("results", [])
+    stats   = scan_state.get("stats",   {"feed": 0, "story": 0, "profile": 0})
+    started = scan_state.get("started_at", "")
+    date_str = started[:10] if started else datetime.now().strftime("%Y-%m-%d")
+
+    prs = Presentation()
+    prs.slide_width  = Inches(13.33)
+    prs.slide_height = Inches(7.5)
+
+    TEAL   = RGBColor(0x5B, 0xBF, 0xAD)
+    AMBER  = RGBColor(0xE0, 0x9A, 0x5A)
+    BLUE   = RGBColor(0x6A, 0x9F, 0xD8)
+    DARK   = RGBColor(0x1C, 0x1C, 0x1A)
+    GRAY   = RGBColor(0x8A, 0x88, 0x80)
+    WHITE  = RGBColor(0xFF, 0xFF, 0xFF)
+    BGCOL  = RGBColor(0xF5, 0xF4, 0xF0)
+
+    def add_text(slide, text, left, top, width, height, size, bold=False, color=DARK, align=PP_ALIGN.LEFT):
+        txBox = slide.shapes.add_textbox(left, top, width, height)
+        tf = txBox.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        p.alignment = align
+        run = p.add_run()
+        run.text = text
+        run.font.size = Pt(size)
+        run.font.bold = bold
+        run.font.color.rgb = color
+
+    # ── Slide 1: Cover ────────────────────────
+    blank = prs.slide_layouts[6]  # completely blank
+    slide1 = prs.slides.add_slide(blank)
+    bg = slide1.background
+    fill = bg.fill
+    fill.solid()
+    fill.fore_color.rgb = BGCOL
+
+    # Title
+    add_text(slide1, "UGC 모니터링 리포트",
+             Inches(1), Inches(1.2), Inches(11), Inches(1.2),
+             size=40, bold=True, color=DARK, align=PP_ALIGN.CENTER)
+
+    # Date + post_url stub (stored in started_at; post_url not in scan_state — omit for now)
+    add_text(slide1, date_str,
+             Inches(1), Inches(2.4), Inches(11), Inches(0.5),
+             size=16, color=GRAY, align=PP_ALIGN.CENTER)
+
+    # Stat boxes
+    box_w, box_h = Inches(3.2), Inches(2.0)
+    stats_info = [
+        ("피드 UGC",   stats.get("feed",    0), TEAL,  Inches(1.0)),
+        ("스토리 UGC", stats.get("story",   0), AMBER, Inches(4.6)),
+        ("프사 변경",  stats.get("profile", 0), BLUE,  Inches(8.2)),
+    ]
+    for label, count, color, left in stats_info:
+        box = slide1.shapes.add_shape(1, left, Inches(3.2), box_w, box_h)  # MSO_SHAPE_TYPE.RECTANGLE=1
+        box.fill.solid()
+        box.fill.fore_color.rgb = color
+        box.line.fill.background()
+        add_text(slide1, label,
+                 left + Inches(0.15), Inches(3.35), box_w - Inches(0.3), Inches(0.4),
+                 size=11, color=WHITE)
+        add_text(slide1, str(count),
+                 left + Inches(0.15), Inches(3.75), box_w - Inches(0.3), Inches(0.9),
+                 size=48, bold=True, color=WHITE)
+        add_text(slide1, "건",
+                 left + Inches(0.15), Inches(4.65), box_w - Inches(0.3), Inches(0.35),
+                 size=13, color=WHITE)
+
+    # Total
+    total = len(results)
+    add_text(slide1, f"총 {total}건 감지",
+             Inches(1), Inches(5.5), Inches(11), Inches(0.6),
+             size=18, bold=True, color=DARK, align=PP_ALIGN.CENTER)
+
+    TYPE_COLOR = {"feed": TEAL, "story": AMBER, "profile": BLUE}
+    TYPE_KO    = {"feed": "피드", "story": "스토리", "profile": "프사변경"}
+
+    # ── Slides 2+: Per-UGC ───────────────────
+    for r in results:
+        slide = prs.slides.add_slide(blank)
+        bg2 = slide.background
+        bg2.fill.solid()
+        bg2.fill.fore_color.rgb = BGCOL
+
+        img_ok = False
+        img_url = r.get("image_url", "")
+        if img_url:
+            try:
+                resp = requests.get(img_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code == 200:
+                    img_data = io.BytesIO(resp.content)
+                    # Fit image into left 55% of slide, top/center
+                    slide.shapes.add_picture(img_data, Inches(0.4), Inches(0.4),
+                                             Inches(7.0), Inches(6.7))
+                    img_ok = True
+            except Exception:
+                pass
+
+        if not img_ok:
+            # placeholder box
+            ph = slide.shapes.add_shape(1, Inches(0.4), Inches(0.4), Inches(7.0), Inches(6.7))
+            ph.fill.solid()
+            ph.fill.fore_color.rgb = RGBColor(0xE2, 0xE0, 0xD8)
+            ph.line.fill.background()
+            add_text(slide, "이미지 없음", Inches(0.4), Inches(3.5), Inches(7.0), Inches(0.6),
+                     size=16, color=GRAY, align=PP_ALIGN.CENTER)
+
+        # Right panel info
+        utype  = r.get("type", "feed")
+        tcol   = TYPE_COLOR.get(utype, DARK)
+        tko    = TYPE_KO.get(utype, utype)
+        uname  = r.get("username", "")
+        link   = r.get("link", "") or ""
+
+        # type badge
+        badge = slide.shapes.add_shape(1, Inches(7.9), Inches(0.6), Inches(1.4), Inches(0.45))
+        badge.fill.solid()
+        badge.fill.fore_color.rgb = tcol
+        badge.line.fill.background()
+        add_text(slide, tko,
+                 Inches(7.9), Inches(0.62), Inches(1.4), Inches(0.4),
+                 size=13, bold=True, color=WHITE, align=PP_ALIGN.CENTER)
+
+        add_text(slide, f"@{uname}",
+                 Inches(7.8), Inches(1.25), Inches(5.1), Inches(0.7),
+                 size=22, bold=True, color=DARK)
+
+        add_text(slide, r.get("detected_at", ""),
+                 Inches(7.8), Inches(2.0), Inches(5.1), Inches(0.45),
+                 size=13, color=GRAY)
+
+        if link:
+            add_text(slide, link,
+                     Inches(7.8), Inches(2.6), Inches(5.1), Inches(1.0),
+                     size=11, color=tcol)
+
+    buf = io.BytesIO()
+    prs.save(buf)
+    buf.seek(0)
+    fname = f"ugc_report_{date_str}.pptx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        headers={"Content-Disposition": f"attachment; filename={fname}"},
+    )
 
 
 @app.get("/")
