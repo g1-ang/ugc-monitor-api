@@ -390,7 +390,7 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
         # 판별 후보 구성 (피드 2장, 스토리 2장으로 제한)
         candidates = []
         for uname, p in profile_map.items():
-            story_urls = story_map.get(uname.lower(), [])[:2]   # max 2
+            story_urls = story_map.get(uname.lower(), [])         # 전체
             latest_posts = p.get("latestPosts") or p.get("posts") or []
             feed_items   = []
             for lp in latest_posts[:3]:                          # max 3
