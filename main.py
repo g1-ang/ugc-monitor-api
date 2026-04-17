@@ -1,14 +1,18 @@
 """
 main.py — UGC Monitor FastAPI 백엔드
 ────────────────────────────────────
-Render에 배포되는 백엔드 서버입니다.
-대시보드(Vercel)에서 호출하면 Phase 1~3을 순서대로 실행합니다.
+Render 배포 또는 로컬 실행 모두 지원.
+로컬: ../start.sh 또는 `uvicorn main:app --port 8000`
+대시보드(Vercel 또는 localhost)에서 호출하면 Phase 1~3을 순서대로 실행합니다.
 
 엔드포인트:
-  POST /scan    → URL + 레퍼런스 이미지로 전체 스캔 시작
+  POST /scan    → URL + 레퍼런스 이미지 + 프롬프트 텍스트로 전체 스캔 시작
   GET  /results → 최신 스캔 결과 조회
   GET  /health  → 서버 상태 확인
+  GET  /        → 로컬 실행 시 index.html 서빙 (없으면 JSON)
 """
+
+from __future__ import annotations  # Python 3.9 호환 (PEP 604 union syntax)
 
 import os, io, time, base64, csv, requests, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,7 +21,7 @@ from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from dotenv import load_dotenv
 from PIL import Image
 from openpyxl import load_workbook
@@ -839,6 +843,14 @@ def export_slides():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+_INDEX_HTML_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "index.html",
+)
+
 @app.get("/")
 def root():
+    # 로컬 실행 시 같은 폴더 구조면 index.html 서빙 (대시보드 즉시 사용 가능)
+    if os.path.exists(_INDEX_HTML_PATH):
+        return FileResponse(_INDEX_HTML_PATH)
     return {"message": "UGC Monitor API", "docs": "/docs"}
