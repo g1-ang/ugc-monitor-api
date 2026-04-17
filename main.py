@@ -48,50 +48,65 @@ APIFY_BASE     = "https://api.apify.com/v2"
 ACTOR_PROFILE  = "apify~instagram-profile-scraper"
 ACTOR_STORY    = "seemuapps~instagram-story-scraper"
 USERNAME_HEADERS = {"username", "user", "userid", "user_id", "아이디", "id"}
-MODEL_NAME     = "Qwen3.5-35B-A3B"  # MoE 아키텍처 (35B 전체, 3B 활성) — 더 빠름
+MODEL_NAME     = "gemini-2.0-flash"  # Gemini 2.0 Flash via NAMC Vertex AI
+API_SEMAPHORE  = threading.Semaphore(6)  # 글로벌 API 호출 동시 한도 (rate limit 회피)
 
-PROMPT_FEED = """앞의 여러 [레퍼런스] 이미지들은 특정 AI 프롬프트로 만든 결과물입니다.
-마지막 [판별 대상]은 유저가 올린 피드 게시물입니다.
+PROMPT_FEED_TEMPLATE = """원본 AI 프롬프트 (이 프롬프트로 [이미지 1] 레퍼런스가 만들어짐):
+═══════════════════════════════════════════════════════
+{prompt_text}
+═══════════════════════════════════════════════════════
 
-배경: 이 프롬프트는 여러 유저가 자기 얼굴로 동일하게 생성하는 구조입니다.
-동일 프롬프트로 만든 이미지는 **얼굴만 다르고 장면·구도·무드가 거의 동일**합니다.
+[이미지 1]: 위 프롬프트로 생성된 레퍼런스 결과물
+[이미지 2]: 유저가 올린 판별 대상 피드 게시물
 
-얼굴(인물 identity)은 무시하고, 아래 6가지 요소로 판단:
-1. 배경·장소 (같은 씬/공간 유형)
-2. 의상·소품 (같은 착장이나 핵심 소품)
-3. 카메라 구도/앵글 (셀피·하이앵글·거울샷 등)
-4. 조명·노출 (광원 방향, 밝기, 분위기)
-5. 색감·톤 (팔레트, 화이트밸런스)
-6. 전체적 무드/스타일
+**핵심 질문**: [이미지 2]가 위 AI 프롬프트로 다른 사람의 얼굴로 생성된 것처럼 보이나요?
 
-판별 규칙:
-- [판별 대상]이 [레퍼런스] **중 어느 하나라도** 위 6가지 중 핵심 3가지 이상 유사하면 YES
-- 모든 [레퍼런스]와 완전히 다르면 NO
-- 얼굴이 달라도 상관없음
-- 단순히 "AI 이미지"거나 "여성 셀카"라는 이유만으로는 NO
-- 배경과 구도 둘 다 완전히 다르면 NO
+판별 방법 — 위 프롬프트의 핵심 요소를 [이미지 2]에서 얼마나 만족하는지 봅니다:
+1. **장면/배경**: 프롬프트가 명시한 환경과 일치하는가? (예: "차 안 뒷좌석"이면 [이미지 2]도 차 안 뒷좌석이어야 함)
+2. **의상**: 프롬프트에 적힌 의상이 보이는가? (구체적인 옷 종류·색·실루엣)
+3. **자세/구도**: 프롬프트가 명시한 포즈·앵글·프레이밍이 일치?
+4. **색감/톤**: 프롬프트의 색감 가이드 (차가운 톤, 저채도 등) 일치?
+5. **전체 인상/질감**: 프롬프트가 의도한 느낌 (예: "구형 폰카 저화질")?
 
-반드시 YES 또는 NO 한 단어만 답하세요."""
+**자주 오판하는 케이스 (모두 NO)**:
+- 둘 다 AI풍 셀카지만 위 프롬프트의 핵심 장면이 아님 → NO
+- 둘 다 자연광 인물 사진이지만 의상·구도·장소가 다름 → NO
+- 위 프롬프트의 요소 중 한두 개만 부분적으로 맞음 → NO
+- 단순히 "AI 셀카", "여성 인물" 같은 표면적 공통점만 겹침 → NO
+- 위 프롬프트의 명시된 "절대 금지" 항목이 [이미지 2]에 보임 → NO
+- 비슷해 보이지만 정말 이 프롬프트로 만든 거라 확신 안 섬 → NO
 
-PROMPT_PROFILE = """앞의 여러 [레퍼런스] 이미지들은 특정 AI 프롬프트로 만든 결과물입니다.
-마지막 [판별 대상]은 유저의 프로필 사진 또는 스토리입니다 (저해상도일 수 있음).
+**YES 조건**: 위 프롬프트의 주요 요소들(장면, 의상, 자세, 색감, 질감) 대부분이 명확히 보이고, "이 프롬프트로 다른 사람으로 다시 생성한 결과"라고 강하게 확신될 때만.
 
-배경: 이 프롬프트는 여러 유저가 자기 얼굴로 동일하게 생성하는 구조입니다.
-프로필 사진은 작고 크롭되어 있을 수 있지만, 핵심 구도/배경이 같으면 같은 프롬프트로 판단합니다.
+확신 안 서면 NO. 반드시 YES 또는 NO 한 단어만 답하세요."""
 
-얼굴은 완전히 무시하고, 아래 요소만 봅니다:
-1. 배경·장소 (같은 씬/공간 유형)
-2. 의상 또는 소품 (있다면)
-3. 카메라 구도·앵글 (거울샷, 셀피, 하이앵글 등)
-4. 전체 분위기·무드
+PROMPT_PROFILE_TEMPLATE = """원본 AI 프롬프트 (이 프롬프트로 [이미지 1] 레퍼런스가 만들어짐):
+═══════════════════════════════════════════════════════
+{prompt_text}
+═══════════════════════════════════════════════════════
 
-판별 규칙:
-- [판별 대상]이 [레퍼런스] **중 어느 하나라도** 위 4가지 중 2가지 이상 유사하면 YES
-- 모든 [레퍼런스]와 완전히 다르면 NO
-- 저해상도·크롭이어도 핵심 구도·배경이 유사하면 YES
-- "둘 다 AI 이미지" 또는 "둘 다 셀카"라는 표면적 공통점만으론 NO
+[이미지 1]: 위 프롬프트로 생성된 고화질 레퍼런스
+[이미지 2]: 유저의 프로필 사진 (저해상도 150×150, 크롭 가능)
 
-반드시 YES 또는 NO 한 단어만 답하세요."""
+**핵심 질문**: 이 작은 프로필 사진이 위 AI 프롬프트로 다른 사람의 얼굴로 생성된 결과물의 일부로 보이나요?
+
+판별 방법 — 저해상도지만 다음을 확인:
+1. **장면/배경의 종류**: 프롬프트가 명시한 환경(예: "차 안 뒷좌석")이 작게라도 인식되는가?
+2. **의상**: 프롬프트의 의상(예: "흰 끈나시 + 회색 가디건")이 작게라도 인식되는가?
+3. **포즈/앵글**: 프롬프트가 지정한 자세나 손 위치(예: "주먹으로 코+입 가림")가 보이는가?
+4. **색감**: 프롬프트의 톤(예: "차가운 톤, 노란기 금지") 일치?
+
+**저해상도이므로 매우 엄격하게**:
+- 디테일이 안 보여서 확신 못 하면 무조건 NO
+- 둘 다 AI풍이라는 공통점만으로는 NO
+- 둘 다 여성 셀카·자연광·클로즈업 같은 표면적 공통점만으론 NO
+- 배경 종류가 프롬프트와 다르면 (예: 차 안이 아니라 카페/방/거울 앞) 무조건 NO
+- 위 프롬프트의 "절대 금지" 항목이 보이면 NO
+- 확신이 80% 미만이면 NO
+
+**YES 조건**: 작은 썸네일이지만 위 프롬프트의 주요 요소들이 명확히 인식되고, "이 프롬프트로 다른 사람으로 만든 결과를 작게 크롭한 것"처럼 보일 때만.
+
+확신 안 서면 NO. 반드시 YES 또는 NO 한 단어만 답하세요."""
 
 app = FastAPI(title="UGC Monitor API")
 
@@ -212,49 +227,67 @@ def run_apify(actor_id: str, run_input: dict, timeout: int = 200) -> list:
 
 
 # ── NAVER Open Models (Qwen2.5-VL) 판별 ───────
-def call_qwen(reference_data_uris: list, target_url: str, img_type: str = "feed", max_retries: int = 3) -> bool | None:
-    """레퍼런스들(data URI 리스트) vs 타겟(URL) 비교. 한 호출로 모든 레퍼런스와 비교."""
-    prompt = PROMPT_PROFILE if img_type in ("profile", "story") else PROMPT_FEED
+def call_model_single(reference_data_uri: str, target_url: str, img_type: str = "feed",
+                      prompt_text: str = "", max_retries: int = 5) -> bool | None:
+    """1개 레퍼런스 vs 1개 타겟 비교 (Gemini 2.0 Flash via NAMC Vertex AI).
+    prompt_text가 있으면 원본 AI 프롬프트를 함께 전달 (하이브리드 판별)."""
+    template = PROMPT_PROFILE_TEMPLATE if img_type in ("profile", "story") else PROMPT_FEED_TEMPLATE
+    prompt = template.format(prompt_text=prompt_text or "(프롬프트 텍스트 없음 — 이미지 비교만 수행)")
     target = target_to_qwen_url(target_url)
     if not target:
         return None
-    content = [{"type": "text", "text": prompt}]
-    for i, ref_uri in enumerate(reference_data_uris, start=1):
-        content.append({"type": "text", "text": f"[레퍼런스 {i}]:"})
-        content.append({"type": "image_url", "image_url": {"url": ref_uri}})
-    content.append({"type": "text", "text": "[판별 대상]:"})
-    content.append({"type": "image_url", "image_url": {"url": target}})
     payload = {
         "model": MODEL_NAME,
-        "messages": [{"role": "user", "content": content}],
+        "target_model_names": MODEL_NAME,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "text", "text": "[이미지 1] 레퍼런스:"},
+                {"type": "image_url", "image_url": {"url": reference_data_uri}},
+                {"type": "text", "text": "[이미지 2] 판별 대상:"},
+                {"type": "image_url", "image_url": {"url": target}},
+            ],
+        }],
         "temperature": 0.1,
         "max_tokens": 10,
     }
     headers = {
         "Authorization": f"Bearer {NAVER_API_KEY}",
-        "Content-Type":  "application/json",
+        "custom-llm-provider": "vertex_ai",
+        "Content-Type": "application/json",
     }
     endpoint = f"{NAVER_API_URL}/chat/completions"
-
     for attempt in range(max_retries):
         try:
-            resp = requests.post(endpoint, json=payload, headers=headers, timeout=20)
+            with API_SEMAPHORE:
+                resp = requests.post(endpoint, json=payload, headers=headers, timeout=90)
             if resp.status_code in (429, 503):
-                time.sleep(2 ** (attempt + 2))
+                time.sleep(min(60, 2 ** (attempt + 2)))
                 continue
             resp.raise_for_status()
             answer = resp.json()["choices"][0]["message"]["content"].strip().upper()
             return "YES" in answer
-        except requests.exceptions.Timeout:
-            print(f"⚠️ Qwen 타임아웃 (시도 {attempt+1}/{max_retries}), 스킵")
-            if attempt < max_retries - 1:
-                time.sleep(2)
-                continue
-            return None
         except Exception as e:
-            print(f"⚠️ Qwen 호출 실패: {e}")
+            print(f"⚠️ Gemini 호출 실패: {str(e)[:120]}")
             return None
     return None
+
+
+def call_qwen(reference_data_uris: list, target_url: str, img_type: str = "feed",
+              prompt_text: str = "") -> bool:
+    """다수의 레퍼런스 vs 1개 타겟 — 각 ref마다 별도 호출 후 2/3 다수결로 매치 결정.
+    이름은 후방 호환을 위해 call_qwen 유지하지만 실제로는 Gemini 2.0 Flash 사용.
+    레퍼런스 1장이면 단순 매치, 2장 이상이면 절반 이상이 YES일 때 매치."""
+    if not reference_data_uris:
+        return False
+    with ThreadPoolExecutor(max_workers=len(reference_data_uris)) as ex:
+        futs = [ex.submit(call_model_single, ru, target_url, img_type, prompt_text)
+                for ru in reference_data_uris]
+        results = [f.result() for f in as_completed(futs)]
+    yes_count = sum(1 for r in results if r is True)
+    threshold = max(1, (len(reference_data_uris) + 1) // 2)  # 다수결 (3장이면 2개, 1장이면 1개)
+    return yes_count >= threshold
 
 
 # ── CLIP 기반 이미지 판별 ───────────────────────
@@ -389,7 +422,8 @@ def parse_comment_file(content: bytes, filename: str) -> list[str]:
 
 
 def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
-                  reference_data_uris: list, post_url: str = ""):
+                  reference_data_uris: list, post_url: str = "",
+                  prompt_text: str = ""):
     global scan_state
     scan_state.update({
         "status": "running", "progress": 5, "step": "댓글 파일 파싱 중...",
@@ -505,7 +539,7 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                 images.append(("feed", item["image_url"], item.get("post_url", "")))
 
             for img_type, img_url, p_url in images:
-                if call_qwen(reference_data_uris, img_url, img_type) is True:
+                if call_qwen(reference_data_uris, img_url, img_type, prompt_text) is True:
                     return {
                         "username":    user["username"],
                         "detected_at": datetime.now().strftime("%H:%M"),
@@ -580,6 +614,7 @@ async def start_scan(
     background_tasks: BackgroundTasks,
     comment_file: UploadFile = File(...),
     post_url: str = Form(""),
+    prompt_text: str = Form(""),
     reference_image_1: Optional[UploadFile] = File(None),
     reference_image_2: Optional[UploadFile] = File(None),
     reference_image_3: Optional[UploadFile] = File(None),
@@ -593,6 +628,9 @@ async def start_scan(
                               reference_image_4, reference_image_5] if f is not None]
     if not ref_files:
         return JSONResponse({"error": "레퍼런스 이미지를 1장 이상 업로드해주세요."}, status_code=422)
+
+    if not prompt_text or not prompt_text.strip():
+        return JSONResponse({"error": "원본 AI 프롬프트 텍스트를 입력해주세요."}, status_code=422)
 
     ref_uris = []
     for f in ref_files:
@@ -610,8 +648,9 @@ async def start_scan(
         "post_url": post_url,
     })
 
-    background_tasks.add_task(run_full_scan, comment_bytes, filename, ref_uris, post_url)
-    return {"status": "started", "filename": filename, "ref_count": len(ref_uris), "post_url": post_url}
+    background_tasks.add_task(run_full_scan, comment_bytes, filename, ref_uris, post_url, prompt_text)
+    return {"status": "started", "filename": filename, "ref_count": len(ref_uris),
+            "post_url": post_url, "prompt_chars": len(prompt_text)}
 
 
 @app.get("/results")
