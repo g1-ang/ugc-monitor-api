@@ -14,7 +14,7 @@ Render 배포 또는 로컬 실행 모두 지원.
 
 from __future__ import annotations  # Python 3.9 호환 (PEP 604 union syntax)
 
-import os, io, time, base64, csv, requests, threading
+import os, io, time, json, base64, csv, requests, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Optional
@@ -130,6 +130,84 @@ scan_state = {
     "started_at": None,
     "post_url":   "",
 }
+
+
+def _find_file(*candidates):
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _load_existing_phase3():
+    """서버 시작 시 phase3_results.json 이 있으면 scan_state 에 복원.
+    저장된 confirmed_ugc(ugc_type/feed_url) → scan_state.results(type/link/image_url) 포맷으로 변환.
+    phase3_candidates.json 에서 image_url 크로스 레퍼런스."""
+    results_path = _find_file("../phase3_results.json", "phase3_results.json")
+    if not results_path:
+        return
+    try:
+        with open(results_path, encoding="utf-8") as f:
+            data = json.load(f)
+        confirmed_raw = data.get("confirmed_ugc", [])
+        if not confirmed_raw:
+            return
+
+        cand_map = {}
+        cands_path = _find_file("../phase3_candidates.json", "phase3_candidates.json")
+        if cands_path:
+            with open(cands_path, encoding="utf-8") as f:
+                for c in json.load(f):
+                    cand_map[c["username"]] = c
+
+        results = []
+        for r in confirmed_raw:
+            uname    = r["username"]
+            ugc_type = r.get("ugc_type", "")
+            link     = r.get("feed_url") or f"https://instagram.com/{uname}/"
+            image_url = ""
+            c = cand_map.get(uname)
+            if c:
+                if ugc_type == "profile":
+                    image_url = c.get("profile_url", "")
+                elif ugc_type == "story":
+                    urls = c.get("story_image_urls") or c.get("story_urls") or []
+                    image_url = urls[0] if urls else c.get("story_image_url", "")
+                elif ugc_type == "feed":
+                    feed_items = c.get("latest_feed_items") or c.get("feed_items") or []
+                    for item in feed_items:
+                        if item.get("post_url") == r.get("feed_url"):
+                            image_url = item.get("image_url", "")
+                            break
+                    if not image_url and feed_items:
+                        image_url = feed_items[0].get("image_url", "")
+
+            results.append({
+                "username":    uname,
+                "detected_at": "",
+                "type":        ugc_type,
+                "link":        link,
+                "image_url":   image_url,
+                "status":      r.get("status", "pending"),  # 검토 큐용 (향후 단계)
+            })
+
+        feed_n    = sum(1 for x in results if x["type"] == "feed")
+        story_n   = sum(1 for x in results if x["type"] == "story")
+        profile_n = sum(1 for x in results if x["type"] == "profile")
+
+        scan_state.update({
+            "status":   "done",
+            "progress": 100,
+            "step":     f"기존 결과 복원 ({len(results)}명)",
+            "results":  results,
+            "stats":    {"feed": feed_n, "story": story_n, "profile": profile_n},
+        })
+        print(f"✓ phase3_results.json 복원: {len(results)}명 (feed {feed_n}, profile {profile_n}, story {story_n})")
+    except Exception as e:
+        print(f"⚠️  phase3_results.json 로드 실패: {e}")
+
+
+_load_existing_phase3()
 
 
 # ── 이미지 리사이즈 ────────────────────────────
@@ -375,7 +453,8 @@ def clip_matches(ref_embs, target_url: str, img_type: str) -> bool:
 
 
 # ── 스캔 히스토리 저장 ─────────────────────────
-def save_scan_history(post_url: str, stats: dict, confirmed: list):
+def save_scan_history(post_url: str, stats: dict, confirmed: list,
+                      campaign_name: str = "", reviewer: str = ""):
     try:
         creds = Credentials.from_service_account_file(
             GOOGLE_CREDENTIALS,
@@ -385,16 +464,22 @@ def save_scan_history(post_url: str, stats: dict, confirmed: list):
         ss = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
         try:
             ws = ss.worksheet(HISTORY_TAB_NAME)
+            header = ws.row_values(1)
+            if "캠페인" not in header:
+                ws.update_cell(1, 2, "캠페인")
+            if "실행자" not in header:
+                # 새 컬럼 추가 (9번째 자리)
+                ws.update_cell(1, 9, "실행자")
         except gspread.WorksheetNotFound:
-            ws = ss.add_worksheet(HISTORY_TAB_NAME, rows=1000, cols=8)
-            ws.append_row(["날짜", "게시물URL", "피드", "스토리", "프사", "총계", "유저목록"],
+            ws = ss.add_worksheet(HISTORY_TAB_NAME, rows=1000, cols=9)
+            ws.append_row(["날짜", "캠페인", "게시물URL", "피드", "스토리", "프사", "총계", "유저목록", "실행자"],
                           value_input_option="RAW")
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         usernames = ",".join(r["username"] for r in confirmed)
         ws.append_row([
-            now, post_url,
+            now, campaign_name, post_url,
             stats.get("feed", 0), stats.get("story", 0), stats.get("profile", 0),
-            len(confirmed), usernames,
+            len(confirmed), usernames, reviewer,
         ], value_input_option="RAW")
     except Exception as e:
         print(f"⚠️ 히스토리 저장 실패: {e}")
@@ -427,11 +512,14 @@ def parse_comment_file(content: bytes, filename: str) -> list[str]:
 
 def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                   reference_data_uris: list, post_url: str = "",
-                  prompt_text: str = ""):
+                  prompt_text: str = "", campaign_name: str = "",
+                  reviewer: str = ""):
     global scan_state
     scan_state.update({
         "status": "running", "progress": 5, "step": "댓글 파일 파싱 중...",
         "results": [], "started_at": datetime.now().isoformat(),
+        "campaign_name": campaign_name,
+        "reviewer": reviewer,
     })
 
     try:
@@ -593,7 +681,7 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
         profile_n = len([r for r in confirmed if r["type"] == "profile"])
         stats_final = {"feed": feed_n, "story": story_n, "profile": profile_n}
 
-        save_scan_history(post_url, stats_final, confirmed)
+        save_scan_history(post_url, stats_final, confirmed, campaign_name, reviewer)
 
         scan_state.update({
             "status":   "done",
@@ -619,6 +707,8 @@ async def start_scan(
     comment_file: UploadFile = File(...),
     post_url: str = Form(""),
     prompt_text: str = Form(""),
+    campaign_name: str = Form(""),
+    reviewer: str = Form(""),
     reference_image_1: Optional[UploadFile] = File(None),
     reference_image_2: Optional[UploadFile] = File(None),
     reference_image_3: Optional[UploadFile] = File(None),
@@ -650,16 +740,149 @@ async def start_scan(
         "results": [], "stats": {"feed": 0, "story": 0, "profile": 0},
         "started_at": datetime.now().isoformat(),
         "post_url": post_url,
+        "campaign_name": campaign_name,
+        "reviewer": reviewer,
     })
 
-    background_tasks.add_task(run_full_scan, comment_bytes, filename, ref_uris, post_url, prompt_text)
+    background_tasks.add_task(run_full_scan, comment_bytes, filename, ref_uris,
+                              post_url, prompt_text, campaign_name, reviewer)
     return {"status": "started", "filename": filename, "ref_count": len(ref_uris),
-            "post_url": post_url, "prompt_chars": len(prompt_text)}
+            "post_url": post_url, "prompt_chars": len(prompt_text),
+            "campaign_name": campaign_name, "reviewer": reviewer}
 
 
 @app.get("/results")
 def get_results():
     return scan_state
+
+
+REVIEW_LOG_TAB = "review_log"
+REVIEW_LOG_HEADER = ["timestamp", "username", "type", "decision", "reviewer", "campaign"]
+
+
+def _get_reviewer() -> str:
+    """검수자 식별 — .env 의 REVIEWER_EMAIL 우선, 없으면 macOS 사용자명"""
+    return os.getenv("REVIEWER_EMAIL") or os.getenv("USER") or "unknown"
+
+
+def _log_review_to_sheets(username: str, ugc_type: str, decision: str, reviewer: str = "") -> None:
+    """review_log 탭에 검수 이력 1행 append. 탭 없으면 헤더와 함께 생성."""
+    try:
+        creds = Credentials.from_service_account_file(
+            GOOGLE_CREDENTIALS,
+            scopes=["https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"],
+        )
+        ss = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+        try:
+            ws = ss.worksheet(REVIEW_LOG_TAB)
+        except gspread.WorksheetNotFound:
+            ws = ss.add_worksheet(title=REVIEW_LOG_TAB, rows=1000, cols=len(REVIEW_LOG_HEADER))
+            ws.append_row(REVIEW_LOG_HEADER, value_input_option="RAW")
+        ws.append_row([
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            username,
+            ugc_type,
+            decision,
+            reviewer or scan_state.get("reviewer") or _get_reviewer(),
+            scan_state.get("campaign_name", "") or os.getenv("CAMPAIGN_NAME", ""),
+        ], value_input_option="RAW")
+    except Exception as e:
+        print(f"⚠️  review_log Sheets 기록 실패: {e}")
+
+
+def _save_phase3_results() -> None:
+    """scan_state.results 의 status 변경을 phase3_results.json 에 반영."""
+    path = _find_file("../phase3_results.json", "phase3_results.json")
+    if not path:
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {"confirmed_ugc": [], "all_results": []}
+    by_user = {r["username"]: r.get("status", "pending") for r in scan_state["results"]}
+    for r in data.get("confirmed_ugc", []):
+        if r["username"] in by_user:
+            r["status"] = by_user[r["username"]]
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️  phase3_results.json 저장 실패: {e}")
+
+
+@app.post("/review/decide")
+def review_decide(username: str = Form(...), decision: str = Form(...),
+                  reviewer: str = Form("")):
+    if decision not in ("approved", "rejected"):
+        return JSONResponse({"error": "decision must be 'approved' or 'rejected'"}, status_code=422)
+    hit = None
+    for r in scan_state.get("results", []):
+        if r.get("username") == username:
+            r["status"] = decision
+            hit = r
+            break
+    if not hit:
+        return JSONResponse({"error": f"username '{username}' not found in current results"}, status_code=404)
+    if reviewer:
+        scan_state["reviewer"] = reviewer  # 브라우저에서 보낸 이름을 메모리에 저장
+    _save_phase3_results()
+    _log_review_to_sheets(username, hit.get("type", ""), decision, reviewer)
+    return {"ok": True, "username": username, "decision": decision, "reviewer": reviewer}
+
+
+@app.get("/review/pending")
+def review_pending():
+    """검토 대기(status=pending) 항목만 필터링해서 반환."""
+    results = scan_state.get("results", [])
+    return {
+        "pending":  [r for r in results if r.get("status") == "pending"],
+        "approved": [r for r in results if r.get("status") == "approved"],
+        "rejected": [r for r in results if r.get("status") == "rejected"],
+    }
+
+
+PHASE3_MATCHED_TAB = "phase3_matched"
+PHASE3_MATCHED_HEADER = ["timestamp", "username", "type", "link", "campaign", "reviewer"]
+
+
+@app.post("/review/export")
+def review_export():
+    """승인된(approved) 유저들을 Google Sheets phase3_matched 탭에 일괄 기록.
+    이미 있는 username 은 중복 기록하지 않음."""
+    results = scan_state.get("results", [])
+    approved = [r for r in results if r.get("status") == "approved"]
+    if not approved:
+        return JSONResponse({"error": "승인된 유저 없음"}, status_code=422)
+    try:
+        creds = Credentials.from_service_account_file(
+            GOOGLE_CREDENTIALS,
+            scopes=["https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"],
+        )
+        ss = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+        try:
+            ws = ss.worksheet(PHASE3_MATCHED_TAB)
+        except gspread.WorksheetNotFound:
+            ws = ss.add_worksheet(title=PHASE3_MATCHED_TAB, rows=500, cols=len(PHASE3_MATCHED_HEADER))
+            ws.append_row(PHASE3_MATCHED_HEADER, value_input_option="RAW")
+        existing = {row[1] for row in ws.get_all_values()[1:] if len(row) > 1 and row[1]}
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        reviewer = scan_state.get("reviewer", "") or _get_reviewer()
+        campaign = scan_state.get("campaign_name", "")
+        new_rows = []
+        for r in approved:
+            if r["username"] in existing:
+                continue
+            new_rows.append([now_str, r["username"], r.get("type", ""),
+                             r.get("link", ""), campaign, reviewer])
+        if new_rows:
+            ws.append_rows(new_rows, value_input_option="RAW")
+        return {"exported": len(new_rows), "skipped_duplicates": len(approved) - len(new_rows),
+                "tab": PHASE3_MATCHED_TAB}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.get("/history")
