@@ -636,7 +636,7 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                         "username":    user["username"],
                         "detected_at": datetime.now().strftime("%H:%M"),
                         "type":        img_type,
-                        "link":        p_url or None,
+                        "link":        p_url or f"https://www.instagram.com/{user['username']}/",
                         "image_url":   img_url,
                     }
             return None
