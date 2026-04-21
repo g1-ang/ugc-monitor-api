@@ -928,8 +928,52 @@ def review_export():
                              r.get("link", ""), campaign, reviewer])
         if new_rows:
             ws.append_rows(new_rows, value_input_option="RAW")
+
+        # ── scan_history 에서 이 스캔 row 를 찾아 '확정 기준' 으로 업데이트 ──
+        history_updated = False
+        try:
+            ws_hist = ss.worksheet(HISTORY_TAB_NAME)
+            hist_rows = ws_hist.get_all_values()
+            if len(hist_rows) > 1:
+                header = hist_rows[0]
+                def col(name, default):  # 1-based 컬럼 번호 탐색 (없으면 default)
+                    return (header.index(name) + 1) if name in header else default
+                camp_col = col("캠페인", 2)
+                url_col  = col("게시물URL", 3)
+                feed_col, story_col, profile_col, total_col, users_col = (
+                    col("피드", 4), col("스토리", 5), col("프사", 6),
+                    col("총계", 7), col("유저목록", 8))
+                # 같은 캠페인 + 같은 post_url 가장 최신 row
+                post_url = scan_state.get("post_url", "")
+                target_row = None
+                for i in range(len(hist_rows) - 1, 0, -1):
+                    row = hist_rows[i]
+                    if (row[camp_col - 1] == campaign and
+                        row[url_col - 1] == post_url):
+                        target_row = i + 1  # 1-based (헤더 포함)
+                        break
+                if target_row:
+                    n_feed    = sum(1 for r in approved if r.get("type") == "feed")
+                    n_story   = sum(1 for r in approved if r.get("type") == "story")
+                    n_profile = sum(1 for r in approved if r.get("type") == "profile")
+                    n_total   = len(approved)
+                    unames    = ",".join(r["username"] for r in approved)
+                    updates = []
+                    def _cell(col_num, value):
+                        a1 = gspread.utils.rowcol_to_a1(target_row, col_num)
+                        updates.append({"range": f"'{HISTORY_TAB_NAME}'!{a1}", "values": [[value]]})
+                    _cell(feed_col,    n_feed)
+                    _cell(story_col,   n_story)
+                    _cell(profile_col, n_profile)
+                    _cell(total_col,   n_total)
+                    _cell(users_col,   unames)
+                    ss.values_batch_update({"valueInputOption": "RAW", "data": updates})
+                    history_updated = True
+        except Exception as e:
+            print(f"⚠️ scan_history 확정 업데이트 실패: {e}")
+
         return {"exported": len(new_rows), "skipped_duplicates": len(approved) - len(new_rows),
-                "tab": PHASE3_MATCHED_TAB}
+                "tab": PHASE3_MATCHED_TAB, "history_updated": history_updated}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
