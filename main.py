@@ -726,6 +726,9 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
             "stats":    stats_final,
         })
 
+        # 서버 재시작 대비: 스캔 결과를 phase3_results.json 에 영구 저장
+        _save_phase3_results_full()
+
     except Exception as e:
         scan_state.update({"status": "error", "step": f"오류: {str(e)}"})
 
@@ -840,25 +843,50 @@ def _log_review_to_sheets(username: str, ugc_type: str, decision: str, reviewer:
         print(f"⚠️  review_log Sheets 기록 실패: {e}")
 
 
-def _save_phase3_results() -> None:
-    """scan_state.results 의 status 변경을 phase3_results.json 에 반영."""
-    path = _find_file("../phase3_results.json", "phase3_results.json")
-    if not path:
-        return
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        data = {"confirmed_ugc": [], "all_results": []}
-    by_user = {r["username"]: r.get("status", "pending") for r in scan_state["results"]}
-    for r in data.get("confirmed_ugc", []):
-        if r["username"] in by_user:
-            r["status"] = by_user[r["username"]]
+def _phase3_results_path() -> str:
+    """phase3_results.json 경로 결정 (메인 repo 루트)."""
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "phase3_results.json")
+
+
+def _save_phase3_results_full() -> None:
+    """현재 scan_state(스캔 완료 시점) 을 phase3_results.json 에 전체 저장.
+    재시작 시 _load_existing_phase3() 가 다시 읽어서 scan_state 복원하도록."""
+    path = _phase3_results_path()
+    confirmed_ugc = []
+    for r in scan_state.get("results", []):
+        link = r.get("link", "") or ""
+        # feed 타입이면 post URL, 아니면 빈 문자열 (프로필 URL은 저장 안함 — load 시 재생성)
+        feed_url = link if ("/p/" in link or "/reel/" in link) else ""
+        confirmed_ugc.append({
+            "username": r["username"],
+            "ugc_type": r.get("type", ""),
+            "feed_url": feed_url,
+            "status":   r.get("status", "pending"),
+        })
+    payload = {
+        "confirmed_ugc": confirmed_ugc,
+        "all_results":   [],
+        "_meta": {
+            "saved_by":      "dashboard",
+            "campaign_name": scan_state.get("campaign_name", ""),
+            "post_url":      scan_state.get("post_url", ""),
+            "reviewer":      scan_state.get("reviewer", ""),
+            "saved_at":      datetime.now().isoformat(),
+        },
+    }
     try:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"✓ phase3_results.json 저장: {len(confirmed_ugc)}명")
     except Exception as e:
         print(f"⚠️  phase3_results.json 저장 실패: {e}")
+
+
+def _save_phase3_results() -> None:
+    """호환용: 이전엔 status만 patch 했지만 지금은 전체 저장."""
+    _save_phase3_results_full()
 
 
 @app.post("/review/decide")
