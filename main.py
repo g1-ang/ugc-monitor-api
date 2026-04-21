@@ -648,6 +648,30 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                     "profile_url": profile_url,
                 })
 
+        # CLI 재실험(analyze_ugc.py --fresh) 대비: 후보를 phase3_candidates.json 에 저장
+        # CLI 스크립트가 읽는 포맷으로 변환해서 저장
+        try:
+            candidates_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "phase3_candidates.json")
+            cli_candidates = []
+            for c in candidates:
+                cli_candidates.append({
+                    "username":           c["username"],
+                    "profile_url":        c.get("profile_url", ""),
+                    "has_story":          bool(c.get("story_urls")),
+                    "story_image_urls":   c.get("story_urls", []),
+                    "story_image_url":    (c.get("story_urls") or [""])[0],
+                    "latest_feed_items":  c.get("feed_items", []),
+                    "latest_feed_urls":   [i.get("image_url", "") for i in c.get("feed_items", [])],
+                    "latest_feed_url":    (c.get("feed_items") or [{}])[0].get("image_url", ""),
+                })
+            with open(candidates_path, "w", encoding="utf-8") as f:
+                json.dump(cli_candidates, f, ensure_ascii=False, indent=2)
+            print(f"✓ phase3_candidates.json 저장: {len(cli_candidates)}명 (CLI 재실험용)")
+        except Exception as e:
+            print(f"⚠️  phase3_candidates.json 저장 실패: {e}")
+
         scan_state.update({"progress": 65, "step": f"AI 이미지 판별 중... (0/{len(candidates)}명)"})
 
         # ── Phase 3: NAVER Qwen3.5-35B-A3B (MoE) 판별 ───
