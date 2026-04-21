@@ -129,7 +129,33 @@ scan_state = {
     "stats":      {"feed": 0, "story": 0, "profile": 0},
     "started_at": None,
     "post_url":   "",
+    "usage":      {"apify_usd": 0.0,
+                   "gemini_input_tokens": 0, "gemini_output_tokens": 0,
+                   "gemini_api_calls": 0},
 }
+
+# 토큰 · 비용 집계는 동시 스레드에서 업데이트되므로 락 필요
+usage_lock = threading.Lock()
+
+# Gemini 2.0 Flash 요금 (Google AI Studio 공식 기준 — NAMC는 별개 과금이므로 "참고값")
+GEMINI_INPUT_COST_PER_M  = 0.10   # USD / 1M input tokens
+GEMINI_OUTPUT_COST_PER_M = 0.40   # USD / 1M output tokens
+
+
+def _add_apify_usage(usd: float):
+    if not usd:
+        return
+    with usage_lock:
+        scan_state["usage"]["apify_usd"] = round(
+            scan_state["usage"]["apify_usd"] + float(usd), 4)
+
+
+def _add_gemini_usage(prompt_tokens: int = 0, completion_tokens: int = 0):
+    with usage_lock:
+        u = scan_state["usage"]
+        u["gemini_input_tokens"]  += int(prompt_tokens or 0)
+        u["gemini_output_tokens"] += int(completion_tokens or 0)
+        u["gemini_api_calls"]     += 1
 
 
 def _find_file(*candidates):
@@ -296,7 +322,12 @@ def run_apify(actor_id: str, run_input: dict, timeout: int = 200) -> list:
         if status_data["status"] == "SUCCEEDED":
             break
         if status_data["status"] in ("FAILED", "ABORTED", "TIMED-OUT"):
+            # 실패여도 부분 과금될 수 있으므로 usage 반영
+            _add_apify_usage(status_data.get("usageTotalUsd") or status_data.get("usageUsd") or 0)
             return []
+
+    # Apify 비용 누적 (usageTotalUsd가 표준 필드)
+    _add_apify_usage(status_data.get("usageTotalUsd") or status_data.get("usageUsd") or 0)
 
     dataset_id = status_data.get("defaultDatasetId", "")
     if not dataset_id:
@@ -348,7 +379,11 @@ def call_model_single(reference_data_uri: str, target_url: str, img_type: str = 
                 time.sleep(min(60, 2 ** (attempt + 2)))
                 continue
             resp.raise_for_status()
-            answer = resp.json()["choices"][0]["message"]["content"].strip().upper()
+            body = resp.json()
+            answer = body["choices"][0]["message"]["content"].strip().upper()
+            # 토큰 사용량 누적 (Gemini/Vertex 는 usage 필드 지원)
+            usage = body.get("usage") or {}
+            _add_gemini_usage(usage.get("prompt_tokens"), usage.get("completion_tokens"))
             return "YES" in answer
         except Exception as e:
             print(f"⚠️ Gemini 호출 실패: {str(e)[:120]}")
@@ -742,6 +777,9 @@ async def start_scan(
         "post_url": post_url,
         "campaign_name": campaign_name,
         "reviewer": reviewer,
+        "usage": {"apify_usd": 0.0,
+                  "gemini_input_tokens": 0, "gemini_output_tokens": 0,
+                  "gemini_api_calls": 0},
     })
 
     background_tasks.add_task(run_full_scan, comment_bytes, filename, ref_uris,
@@ -753,7 +791,18 @@ async def start_scan(
 
 @app.get("/results")
 def get_results():
-    return scan_state
+    # Gemini 비용 계산해서 usage에 포함 (공식 단가 기준 — NAMC는 별개 과금)
+    u = scan_state.get("usage", {}) or {}
+    in_tok  = u.get("gemini_input_tokens", 0)
+    out_tok = u.get("gemini_output_tokens", 0)
+    gemini_cost = round(
+        in_tok  * GEMINI_INPUT_COST_PER_M  / 1_000_000 +
+        out_tok * GEMINI_OUTPUT_COST_PER_M / 1_000_000,
+        4)
+    return {**scan_state,
+            "usage": {**u,
+                      "gemini_estimated_usd": gemini_cost,
+                      "total_estimated_usd":  round(u.get("apify_usd", 0.0) + gemini_cost, 4)}}
 
 
 REVIEW_LOG_TAB = "review_log"
