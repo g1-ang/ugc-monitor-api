@@ -53,7 +53,7 @@ ACTOR_PROFILE  = "apify~instagram-profile-scraper"
 ACTOR_STORY    = "seemuapps~instagram-story-scraper"
 USERNAME_HEADERS = {"username", "user", "userid", "user_id", "아이디", "id"}
 MODEL_NAME     = "gemini-2.0-flash"  # Gemini 2.0 Flash via NAMC Vertex AI
-API_SEMAPHORE  = threading.Semaphore(6)  # 글로벌 API 호출 동시 한도 (rate limit 회피)
+API_SEMAPHORE  = threading.Semaphore(10)  # 글로벌 API 호출 동시 한도 (429 뜨면 낮춰야 함)
 
 PROMPT_FEED_TEMPLATE = """원본 AI 프롬프트 (이 프롬프트로 [이미지 1] 레퍼런스가 만들어짐):
 ═══════════════════════════════════════════════════════
