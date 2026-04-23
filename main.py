@@ -858,11 +858,79 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
             "stats":    stats_final,
         })
 
+        # 같은 캠페인의 과거 검수 이력 자동 재적용 (이미 approved/rejected 된 것 반복 검수 방지)
+        _apply_previous_campaign_decisions(campaign_name)
+
         # 서버 재시작 대비: 스캔 결과를 phase3_results.json 에 영구 저장
         _save_phase3_results_full()
 
     except Exception as e:
         scan_state.update({"status": "error", "step": f"오류: {str(e)}"})
+
+
+def _apply_previous_campaign_decisions(campaign: str) -> None:
+    """같은 campaign 의 phase3_matched / review_log 에서 과거 (username, type) 결정을
+    로드해서 현재 scan_state.results 의 status 에 반영.
+    - phase3_matched 에 있는 (u, t) → approved
+    - review_log 의 최신 decision 이 rejected → rejected
+    재스캔 시 담당자가 같은 유저 또 검수할 필요 없음."""
+    if not campaign:
+        return
+    try:
+        creds = Credentials.from_service_account_file(
+            GOOGLE_CREDENTIALS,
+            scopes=["https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"],
+        )
+        ss = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+
+        approved_keys: set = set()
+        try:
+            ws = ss.worksheet(PHASE3_MATCHED_TAB)
+            rows = ws.get_all_values()[1:]  # skip header
+            # header: timestamp, username, type, link, campaign, reviewer
+            for r in rows:
+                if len(r) >= 5 and r[4] == campaign and r[1]:
+                    approved_keys.add((r[1], r[2]))
+        except gspread.WorksheetNotFound:
+            pass
+
+        # review_log: 최신 decision 이 rejected 인 것만 사용 (approved 는 phase3_matched 에서 봄)
+        rejected_keys: set = set()
+        try:
+            ws = ss.worksheet(REVIEW_LOG_TAB)
+            rows = ws.get_all_values()[1:]
+            # header: timestamp, username, type, decision, reviewer, campaign
+            latest: dict = {}   # (username, type) -> (timestamp, decision)
+            for r in rows:
+                if len(r) < 6:
+                    continue
+                if r[5] != campaign:
+                    continue
+                key = (r[1], r[2])
+                prev = latest.get(key)
+                if prev is None or r[0] > prev[0]:
+                    latest[key] = (r[0], r[3])
+            for key, (_, d) in latest.items():
+                if d == "rejected":
+                    rejected_keys.add(key)
+        except gspread.WorksheetNotFound:
+            pass
+
+        reuse_count = 0
+        for r in scan_state.get("results", []):
+            key = (r["username"], r.get("type", ""))
+            if key in approved_keys:
+                r["status"] = "approved"
+                reuse_count += 1
+            elif key in rejected_keys:
+                r["status"] = "rejected"
+                reuse_count += 1
+
+        if reuse_count:
+            print(f"✓ 과거 검수 재적용: {reuse_count}건 (캠페인: {campaign})")
+    except Exception as e:
+        print(f"⚠️ 과거 검수 이력 로드 실패: {e}")
 
 
 # ── API 엔드포인트 ─────────────────────────────
@@ -1058,6 +1126,57 @@ def review_pending():
 
 PHASE3_MATCHED_TAB = "phase3_matched"
 PHASE3_MATCHED_HEADER = ["timestamp", "username", "type", "link", "campaign", "reviewer"]
+
+
+@app.get("/campaign/cumulative")
+def campaign_cumulative(campaign: str = ""):
+    """특정 캠페인(또는 전체)의 누적 확정 유저를 phase3_matched 에서 가져와서 리턴.
+    같은 유저가 여러 스캔에서 잡혀도 (username, type) 조합 기준으로 unique.
+    campaign 파라미터 없으면 전체 캠페인 리스트만 리턴."""
+    try:
+        creds = Credentials.from_service_account_file(
+            GOOGLE_CREDENTIALS,
+            scopes=["https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"],
+        )
+        ss = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+        try:
+            ws = ss.worksheet(PHASE3_MATCHED_TAB)
+        except gspread.WorksheetNotFound:
+            return {"campaigns": [], "users": []}
+        rows = ws.get_all_values()[1:]
+        # header: timestamp, username, type, link, campaign, reviewer
+        campaigns_all = sorted({r[4] for r in rows if len(r) >= 5 and r[4]}, reverse=True)
+        if not campaign:
+            return {"campaigns": campaigns_all, "users": []}
+        # 해당 캠페인의 (username, type) unique, 최신 timestamp 유지
+        latest: dict = {}
+        for r in rows:
+            if len(r) < 6 or r[4] != campaign or not r[1]:
+                continue
+            key = (r[1], r[2])
+            prev = latest.get(key)
+            if prev is None or r[0] > prev["timestamp"]:
+                latest[key] = {
+                    "username":  r[1],
+                    "type":      r[2],
+                    "link":      r[3] if len(r) > 3 else "",
+                    "reviewer":  r[5] if len(r) > 5 else "",
+                    "timestamp": r[0],
+                }
+        users = sorted(latest.values(), key=lambda x: x["timestamp"], reverse=True)
+        feed_n    = sum(1 for u in users if u["type"] == "feed")
+        story_n   = sum(1 for u in users if u["type"] == "story")
+        profile_n = sum(1 for u in users if u["type"] == "profile")
+        return {
+            "campaigns": campaigns_all,
+            "campaign":  campaign,
+            "users":     users,
+            "stats":     {"feed": feed_n, "story": story_n, "profile": profile_n,
+                          "total": len(users)},
+        }
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.post("/review/export")
