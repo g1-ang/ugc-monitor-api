@@ -391,20 +391,70 @@ def call_model_single(reference_data_uri: str, target_url: str, img_type: str = 
     return None
 
 
+# 프롬프트에서 이미지 format 관련 제약을 포함하는 라인 감지용 키워드
+# (예: "상/하 2컷 콜라주" 같은 문구가 있으면 1-분할 크롭 유저가 자동으로 NO 처리됨)
+FORMAT_CONSTRAINT_KEYWORDS = [
+    "2-분할", "2분할", "2 분할", "2컷", "2 컷",
+    "상/하", "상/하단", "상·하", "상하 분할", "상단 컷", "하단 컷",
+    "콜라주", "듀얼", "듀얼컷", "diptych", "dual", "split", "two-panel",
+    "좌/우", "좌우 분할", "3-분할", "4-분할", "n-분할",
+]
+
+
+def has_format_constraint(prompt_text: str) -> list[str]:
+    """프롬프트에서 format 제약 키워드를 찾아서 리스트로 반환. 비어 있으면 제약 없음."""
+    if not prompt_text:
+        return []
+    hits = []
+    for kw in FORMAT_CONSTRAINT_KEYWORDS:
+        if kw in prompt_text:
+            hits.append(kw)
+    return hits
+
+
+def strip_format_constraints(prompt_text: str) -> str:
+    """프롬프트에서 format 제약이 포함된 줄을 제거한 relaxed 버전 생성.
+    1-분할 크롭 등 변형 업로드도 잡을 수 있도록 2-pass 스캔의 2번째 pass 용."""
+    if not prompt_text:
+        return prompt_text
+    kept = []
+    for line in prompt_text.splitlines():
+        if any(kw in line for kw in FORMAT_CONSTRAINT_KEYWORDS):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def call_qwen(reference_data_uris: list, target_url: str, img_type: str = "feed",
               prompt_text: str = "") -> bool:
-    """다수의 레퍼런스 vs 1개 타겟 — 각 ref마다 별도 호출 후 2/3 다수결로 매치 결정.
-    이름은 후방 호환을 위해 call_qwen 유지하지만 실제로는 Gemini 2.0 Flash 사용.
-    레퍼런스 1장이면 단순 매치, 2장 이상이면 절반 이상이 YES일 때 매치."""
+    """다수의 레퍼런스 vs 1개 타겟 — 각 ref마다 별도 호출 후 다수결로 매치 결정.
+    2-pass 전략: strict(원본 프롬프트) NO 이면 relaxed(format 제약 제거) 로 재시도.
+    → 프롬프트에 "2-분할" 등이 있어도 1-분할 크롭을 올린 유저를 잡음.
+
+    이름은 후방 호환을 위해 call_qwen 유지하지만 실제로는 Gemini 2.0 Flash 사용."""
     if not reference_data_uris:
         return False
-    with ThreadPoolExecutor(max_workers=len(reference_data_uris)) as ex:
-        futs = [ex.submit(call_model_single, ru, target_url, img_type, prompt_text)
-                for ru in reference_data_uris]
-        results = [f.result() for f in as_completed(futs)]
-    yes_count = sum(1 for r in results if r is True)
-    threshold = max(1, (len(reference_data_uris) + 1) // 2)  # 다수결 (3장이면 2개, 1장이면 1개)
-    return yes_count >= threshold
+
+    def _vote(pt: str) -> bool:
+        with ThreadPoolExecutor(max_workers=len(reference_data_uris)) as ex:
+            futs = [ex.submit(call_model_single, ru, target_url, img_type, pt)
+                    for ru in reference_data_uris]
+            results = [f.result() for f in as_completed(futs)]
+        yes_count = sum(1 for r in results if r is True)
+        threshold = max(1, (len(reference_data_uris) + 1) // 2)
+        return yes_count >= threshold
+
+    # Pass 1: strict (원본 프롬프트 그대로)
+    if _vote(prompt_text):
+        return True
+
+    # Pass 2: relaxed — format 제약을 포함하는 줄 제거 (있을 때만)
+    if has_format_constraint(prompt_text):
+        relaxed = strip_format_constraints(prompt_text)
+        if relaxed and relaxed != prompt_text and _vote(relaxed):
+            return True
+
+    return False
 
 
 # ── CLIP 기반 이미지 판별 ───────────────────────
