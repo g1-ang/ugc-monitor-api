@@ -740,14 +740,17 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
         phase3_lock   = threading.Lock()
 
         def detect_one(user):
-            """단일 유저 판별 — NAVER API 호출"""
+            """단일 유저 판별 — NAVER API 호출.
+            스캔 순서: feed > story > profile (가장 강한 신호부터).
+            첫 YES 에서 종료 — feed 에 UGC 있으면 '프사변경'으로 잘못 분류되지 않도록.
+            프사 매칭은 가장 FP 위험 큰 약한 신호라 마지막."""
             images = []
-            if user.get("profile_url"):
-                images.append(("profile", user["profile_url"], ""))
-            for s_url in user.get("story_urls", []):
-                images.append(("story", s_url, ""))
             for item in user.get("feed_items", []):
                 images.append(("feed", item["image_url"], item.get("post_url", "")))
+            for s_url in user.get("story_urls", []):
+                images.append(("story", s_url, ""))
+            if user.get("profile_url"):
+                images.append(("profile", user["profile_url"], ""))
 
             match = None
             for img_type, img_url, p_url in images:
