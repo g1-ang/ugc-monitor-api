@@ -740,10 +740,9 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
         phase3_lock   = threading.Lock()
 
         def detect_one(user):
-            """단일 유저 판별 — NAVER API 호출.
-            스캔 순서: feed > story > profile (가장 강한 신호부터).
-            첫 YES 에서 종료 — feed 에 UGC 있으면 '프사변경'으로 잘못 분류되지 않도록.
-            프사 매칭은 가장 FP 위험 큰 약한 신호라 마지막."""
+            """단일 유저 판별 — 타입별로 최대 1건씩 매치 반환.
+            피드 + 프사 둘 다 YES 면 두 건 모두 리턴 → 마케터가 각각 검수.
+            같은 타입 내 여러 이미지(피드 3장 등)는 첫 YES 1건만."""
             images = []
             for item in user.get("feed_items", []):
                 images.append(("feed", item["image_url"], item.get("post_url", "")))
@@ -752,8 +751,11 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
             if user.get("profile_url"):
                 images.append(("profile", user["profile_url"], ""))
 
-            match = None
+            found: dict[str, dict] = {}
             for img_type, img_url, p_url in images:
+                if img_type in found:
+                    # 이미 이 타입에서 매치 잡음 — 나머지 이미지는 스캔 생략 (비용 절약)
+                    continue
                 is_match = call_qwen(reference_data_uris, img_url, img_type, prompt_text)
                 with phase3_lock:
                     s = phase3_stats[img_type]
@@ -763,17 +765,16 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                     elif is_match is False:
                         s["no"] += 1
                     elif is_match is None and img_type == "story":
-                        # 스토리 mp4 프레임 추출 실패 (None 반환 케이스)
                         s["extract_fail"] += 1
-                if match is None and is_match is True:
-                    match = {
+                if is_match is True:
+                    found[img_type] = {
                         "username":    user["username"],
                         "detected_at": datetime.now().strftime("%H:%M"),
                         "type":        img_type,
                         "link":        p_url or f"https://www.instagram.com/{user['username']}/",
                         "image_url":   img_url,
                     }
-            return match
+            return list(found.values())
 
         with ThreadPoolExecutor(max_workers=8) as pool:
             futures = {pool.submit(detect_one, u): u for u in candidates}
@@ -781,9 +782,9 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                 with done_lock:
                     done_count += 1
                     n = done_count
-                result = future.result()
-                if result:
-                    confirmed.append(result)
+                user_matches = future.result()   # list — 타입별 매치 (0~3건)
+                if user_matches:
+                    confirmed.extend(user_matches)
                 scan_state.update({
                     "progress": 65 + int(n / max(len(candidates), 1) * 30),
                     "step": f"AI 이미지 판별 중... ({n}/{len(candidates)}명)",
@@ -1022,22 +1023,26 @@ def _save_phase3_results() -> None:
 
 @app.post("/review/decide")
 def review_decide(username: str = Form(...), decision: str = Form(...),
-                  reviewer: str = Form("")):
+                  type: str = Form(""), reviewer: str = Form("")):
+    """검수 결과 저장. type 이 주어지면 해당 (username, type) 행만 업데이트 —
+    같은 유저가 feed + profile 둘 다 매치된 경우 각각 따로 검수 가능."""
     if decision not in ("approved", "rejected"):
         return JSONResponse({"error": "decision must be 'approved' or 'rejected'"}, status_code=422)
     hit = None
     for r in scan_state.get("results", []):
-        if r.get("username") == username:
+        if r.get("username") == username and (not type or r.get("type") == type):
             r["status"] = decision
             hit = r
             break
     if not hit:
-        return JSONResponse({"error": f"username '{username}' not found in current results"}, status_code=404)
+        return JSONResponse({"error": f"{username}/{type or '(any)'} not found in current results"},
+                            status_code=404)
     if reviewer:
-        scan_state["reviewer"] = reviewer  # 브라우저에서 보낸 이름을 메모리에 저장
+        scan_state["reviewer"] = reviewer
     _save_phase3_results()
     _log_review_to_sheets(username, hit.get("type", ""), decision, reviewer)
-    return {"ok": True, "username": username, "decision": decision, "reviewer": reviewer}
+    return {"ok": True, "username": username, "type": hit.get("type", ""),
+            "decision": decision, "reviewer": reviewer}
 
 
 @app.get("/review/pending")
@@ -1075,13 +1080,16 @@ def review_export():
         except gspread.WorksheetNotFound:
             ws = ss.add_worksheet(title=PHASE3_MATCHED_TAB, rows=500, cols=len(PHASE3_MATCHED_HEADER))
             ws.append_row(PHASE3_MATCHED_HEADER, value_input_option="RAW")
-        existing = {row[1] for row in ws.get_all_values()[1:] if len(row) > 1 and row[1]}
+        # (username, type) 조합으로 dedup — 같은 유저의 피드+프사 둘 다 confirmed 면 둘 다 저장
+        existing = {(row[1], row[2]) for row in ws.get_all_values()[1:]
+                    if len(row) > 2 and row[1]}
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         reviewer = scan_state.get("reviewer", "") or _get_reviewer()
         campaign = scan_state.get("campaign_name", "")
         new_rows = []
         for r in approved:
-            if r["username"] in existing:
+            key = (r["username"], r.get("type", ""))
+            if key in existing:
                 continue
             new_rows.append([now_str, r["username"], r.get("type", ""),
                              r.get("link", ""), campaign, reviewer])
