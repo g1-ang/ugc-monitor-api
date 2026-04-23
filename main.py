@@ -435,23 +435,26 @@ def call_qwen(reference_data_uris: list, target_url: str, img_type: str = "feed"
     if not reference_data_uris:
         return False
 
-    def _vote(pt: str) -> bool:
+    def _vote(pt: str, permissive: bool = False) -> bool:
+        """permissive=False → 다수결(엄격). True → 1장 이상 YES 면 통과(완화)."""
         with ThreadPoolExecutor(max_workers=len(reference_data_uris)) as ex:
             futs = [ex.submit(call_model_single, ru, target_url, img_type, pt)
                     for ru in reference_data_uris]
             results = [f.result() for f in as_completed(futs)]
         yes_count = sum(1 for r in results if r is True)
-        threshold = max(1, (len(reference_data_uris) + 1) // 2)
+        threshold = 1 if permissive else max(1, (len(reference_data_uris) + 1) // 2)
         return yes_count >= threshold
 
-    # Pass 1: strict (원본 프롬프트 그대로)
-    if _vote(prompt_text):
+    # Pass 1: strict (원본 프롬프트 + 다수결)
+    if _vote(prompt_text, permissive=False):
         return True
 
-    # Pass 2: relaxed — format 제약을 포함하는 줄 제거 (있을 때만)
+    # Pass 2: format 제약 있는 프롬프트라면 relaxed + permissive(1장 이상 YES)
+    # → 2-분할 원본 ref 여러 장 + 1-분할 crop ref 1~2장 섞여 있어도 1-분할 유저 잡힘
+    # → FP 위험은 늘지만 어차피 휴먼 검수로 최종 판정
     if has_format_constraint(prompt_text):
         relaxed = strip_format_constraints(prompt_text)
-        if relaxed and relaxed != prompt_text and _vote(relaxed):
+        if relaxed and relaxed != prompt_text and _vote(relaxed, permissive=True):
             return True
 
     return False
