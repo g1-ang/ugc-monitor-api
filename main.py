@@ -678,6 +678,13 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
         confirmed     = []
         done_count    = 0
         done_lock     = threading.Lock()
+        # 타입별 판별 집계 (스토리 0건 매치가 정상인지/이상인지 사후 진단용)
+        phase3_stats  = {
+            "profile": {"scanned": 0, "yes": 0, "no": 0},
+            "feed":    {"scanned": 0, "yes": 0, "no": 0},
+            "story":   {"scanned": 0, "yes": 0, "no": 0, "extract_fail": 0},
+        }
+        phase3_lock   = threading.Lock()
 
         def detect_one(user):
             """단일 유저 판별 — NAVER API 호출"""
@@ -689,16 +696,28 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
             for item in user.get("feed_items", []):
                 images.append(("feed", item["image_url"], item.get("post_url", "")))
 
+            match = None
             for img_type, img_url, p_url in images:
-                if call_qwen(reference_data_uris, img_url, img_type, prompt_text) is True:
-                    return {
+                is_match = call_qwen(reference_data_uris, img_url, img_type, prompt_text)
+                with phase3_lock:
+                    s = phase3_stats[img_type]
+                    s["scanned"] += 1
+                    if is_match is True:
+                        s["yes"] += 1
+                    elif is_match is False:
+                        s["no"] += 1
+                    elif is_match is None and img_type == "story":
+                        # 스토리 mp4 프레임 추출 실패 (None 반환 케이스)
+                        s["extract_fail"] += 1
+                if match is None and is_match is True:
+                    match = {
                         "username":    user["username"],
                         "detected_at": datetime.now().strftime("%H:%M"),
                         "type":        img_type,
                         "link":        p_url or f"https://www.instagram.com/{user['username']}/",
                         "image_url":   img_url,
                     }
-            return None
+            return match
 
         with ThreadPoolExecutor(max_workers=8) as pool:
             futures = {pool.submit(detect_one, u): u for u in candidates}
@@ -739,6 +758,38 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
         story_n   = len([r for r in confirmed if r["type"] == "story"])
         profile_n = len([r for r in confirmed if r["type"] == "profile"])
         stats_final = {"feed": feed_n, "story": story_n, "profile": profile_n}
+
+        # 진단 로그: 타입별 판별 집계 print + disk 저장
+        print("\n" + "=" * 60)
+        print(f"  Phase 3 진단 요약 — 캠페인: {campaign_name or '(미지정)'}")
+        print("=" * 60)
+        print(f"  댓글러: {len(usernames)}명  /  판별 후보: {len(candidates)}명")
+        for t in ("profile", "feed", "story"):
+            s = phase3_stats[t]
+            line = f"  {t:8s}  스캔 {s['scanned']:4d}  →  YES {s['yes']}  NO {s['no']}"
+            if t == "story" and s.get("extract_fail"):
+                line += f"  (mp4 추출 실패 {s['extract_fail']})"
+            print(line)
+        print(f"  최종 confirmed: {len(confirmed)}명 (feed {feed_n} / story {story_n} / profile {profile_n})")
+        print("=" * 60 + "\n")
+        try:
+            summary_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "phase3_last_scan_summary.json")
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "campaign":     campaign_name,
+                    "reviewer":     reviewer,
+                    "post_url":     post_url,
+                    "finished_at":  datetime.now().isoformat(),
+                    "commenters":   len(usernames),
+                    "candidates":   len(candidates),
+                    "phase3_stats": phase3_stats,
+                    "confirmed":    {"feed": feed_n, "story": story_n, "profile": profile_n,
+                                     "total": len(confirmed)},
+                }, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"⚠️  phase3_last_scan_summary.json 저장 실패: {e}")
 
         save_scan_history(post_url, stats_final, confirmed, campaign_name, reviewer)
 
