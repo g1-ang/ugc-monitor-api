@@ -1090,10 +1090,12 @@ def _save_phase3_results() -> None:
 
 
 @app.post("/review/decide")
-def review_decide(username: str = Form(...), decision: str = Form(...),
+def review_decide(background_tasks: BackgroundTasks,
+                  username: str = Form(...), decision: str = Form(...),
                   type: str = Form(""), reviewer: str = Form("")):
     """검수 결과 저장. type 이 주어지면 해당 (username, type) 행만 업데이트 —
-    같은 유저가 feed + profile 둘 다 매치된 경우 각각 따로 검수 가능."""
+    같은 유저가 feed + profile 둘 다 매치된 경우 각각 따로 검수 가능.
+    검수 즉시 phase3_matched 탭에도 자동 upsert (백그라운드)."""
     if decision not in ("approved", "rejected"):
         return JSONResponse({"error": "decision must be 'approved' or 'rejected'"}, status_code=422)
     hit = None
@@ -1109,8 +1111,16 @@ def review_decide(username: str = Form(...), decision: str = Form(...),
         scan_state["reviewer"] = reviewer
     _save_phase3_results()
     _log_review_to_sheets(username, hit.get("type", ""), decision, reviewer)
+
+    # phase3_matched 탭 자동 upsert (백그라운드 — 사용자는 즉시 응답 받음)
+    campaign = scan_state.get("campaign_name", "") or ""
+    background_tasks.add_task(_phase3_matched_upsert,
+                              username, hit.get("type", ""), hit.get("link", "") or "",
+                              campaign, reviewer, decision)
+
     return {"ok": True, "username": username, "type": hit.get("type", ""),
-            "decision": decision, "reviewer": reviewer}
+            "decision": decision, "reviewer": reviewer,
+            "auto_synced": True}
 
 
 @app.get("/review/pending")
@@ -1126,6 +1136,52 @@ def review_pending():
 
 PHASE3_MATCHED_TAB = "phase3_matched"
 PHASE3_MATCHED_HEADER = ["timestamp", "username", "type", "link", "campaign", "reviewer"]
+
+
+def _phase3_matched_upsert(username: str, type_: str, link: str,
+                           campaign: str, reviewer: str, decision: str):
+    """검수 결정마다 phase3_matched 탭에 자동 반영.
+    - approved: (username, type, campaign) 키 기준으로 없으면 추가
+    - rejected: 같은 키 행이 있으면 제거 (잘못 승인 → 변경 케이스)
+    백그라운드 호출용 — 실패해도 사용자에게 영향 X."""
+    try:
+        creds = Credentials.from_service_account_file(
+            GOOGLE_CREDENTIALS,
+            scopes=["https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"],
+        )
+        ss = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+        try:
+            ws = ss.worksheet(PHASE3_MATCHED_TAB)
+        except gspread.WorksheetNotFound:
+            if decision != "approved":
+                return  # 탭 없는데 reject할 게 없음
+            ws = ss.add_worksheet(title=PHASE3_MATCHED_TAB,
+                                  rows=500, cols=len(PHASE3_MATCHED_HEADER))
+            ws.append_row(PHASE3_MATCHED_HEADER, value_input_option="RAW")
+
+        rows = ws.get_all_values()
+        existing_row_idx = None
+        for i, r in enumerate(rows[1:], start=2):  # header 제외, 1-based
+            if (len(r) >= 5 and r[1] == username and r[2] == type_
+                    and r[4] == campaign):
+                existing_row_idx = i
+                break
+
+        if decision == "approved":
+            if existing_row_idx is None:
+                now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                ws.append_row([now_str, username, type_, link, campaign, reviewer],
+                              value_input_option="RAW")
+                print(f"  ✓ phase3_matched 자동 추가: @{username} ({type_}) [{campaign}]")
+            else:
+                print(f"  · phase3_matched 이미 있음: @{username} ({type_}) [{campaign}]")
+        elif decision == "rejected":
+            if existing_row_idx is not None:
+                ws.delete_rows(existing_row_idx)
+                print(f"  ✓ phase3_matched 자동 제거: @{username} ({type_}) [{campaign}]")
+    except Exception as e:
+        print(f"⚠️ phase3_matched upsert 실패 ({username}/{type_}): {e}")
 
 
 @app.get("/campaign/cumulative")
