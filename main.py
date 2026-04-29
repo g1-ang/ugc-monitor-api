@@ -509,8 +509,9 @@ def call_qwen(reference_data_uris: list, target_url: str, img_type: str = "feed"
         threshold = 1 if permissive else max(1, (len(reference_data_uris) + 1) // 2)
         return yes_count >= threshold
 
-    # 관대 모드: format 제약(2-분할 등) 자동 제거 + 관대 템플릿 + permissive(1/3)
-    if lenient_mode:
+    # 관대 모드 + 피드만: 헤어/의상 차이가 큰 변형/유지형은 피드에 적용해야 효과
+    # (프사·스토리는 저해상도 + 다른 사람 사진이라 lenient 적용 시 false positive 폭증)
+    if lenient_mode and img_type == "feed":
         pt = prompt_text
         if has_format_constraint(pt):
             stripped = strip_format_constraints(pt)
@@ -518,7 +519,8 @@ def call_qwen(reference_data_uris: list, target_url: str, img_type: str = "feed"
                 pt = stripped
         return _vote(pt, permissive=True, use_lenient_template=True)
 
-    # 일반 모드: Pass 1 strict (원본 프롬프트 + 다수결)
+    # 그 외 (lenient_mode + 프사/스토리는 여기로 떨어짐 → 일반 모드 유지)
+    # Pass 1: strict (원본 프롬프트 + 다수결)
     if _vote(prompt_text, permissive=False, use_lenient_template=False):
         return True
 
