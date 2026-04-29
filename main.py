@@ -509,9 +509,14 @@ def call_qwen(reference_data_uris: list, target_url: str, img_type: str = "feed"
         threshold = 1 if permissive else max(1, (len(reference_data_uris) + 1) // 2)
         return yes_count >= threshold
 
-    # 관대 모드: 단일 pass + 관대 템플릿 + permissive(1/3)
+    # 관대 모드: format 제약(2-분할 등) 자동 제거 + 관대 템플릿 + permissive(1/3)
     if lenient_mode:
-        return _vote(prompt_text, permissive=True, use_lenient_template=True)
+        pt = prompt_text
+        if has_format_constraint(pt):
+            stripped = strip_format_constraints(pt)
+            if stripped:
+                pt = stripped
+        return _vote(pt, permissive=True, use_lenient_template=True)
 
     # 일반 모드: Pass 1 strict (원본 프롬프트 + 다수결)
     if _vote(prompt_text, permissive=False, use_lenient_template=False):
