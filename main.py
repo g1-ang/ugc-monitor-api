@@ -754,18 +754,44 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
             if idx < len(story_chunks) - 1:
                 time.sleep(2)
 
-        # 판별 후보 구성 (피드 2장, 스토리 2장으로 제한)
+        # 판별 후보 구성
+        # - 핀(isPinned)된 게시글 제외 → 진짜 최신만
+        # - timestamp 내림차순 정렬 (최신부터)
+        # - 캐러셀(Sidecar)이면 images[] 전체 포함 → 디카샷이 2/3번째여도 잡힘
+        # - 유저당 최대 8장 (캐러셀이 너무 길면 비용 폭증 방지)
         candidates = []
         for uname, p in profile_map.items():
             story_urls = story_map.get(uname.lower(), [])         # 전체
             latest_posts = p.get("latestPosts") or p.get("posts") or []
-            feed_items   = []
-            for lp in latest_posts[:3]:                          # max 3
-                img_url = lp.get("displayUrl") or lp.get("imageUrl") or ""
-                sc      = lp.get("shortCode") or lp.get("shortcode") or ""
-                p_url   = f"https://www.instagram.com/p/{sc}/" if sc else lp.get("url", "")
-                if img_url:
-                    feed_items.append({"image_url": img_url, "post_url": p_url})
+            # 1. 핀 제외 + 최신순 정렬
+            non_pinned = [lp for lp in latest_posts if not lp.get("isPinned")]
+            non_pinned.sort(key=lambda lp: lp.get("timestamp", ""), reverse=True)
+
+            feed_items = []
+            total_imgs = 0
+            for lp in non_pinned[:3]:                            # 최신 3개 게시글
+                if total_imgs >= 8:
+                    break
+                sc    = lp.get("shortCode") or lp.get("shortcode") or ""
+                p_url = f"https://www.instagram.com/p/{sc}/" if sc else lp.get("url", "")
+
+                # 캐러셀(Sidecar)이면 images[] 모두, 아니면 displayUrl 1장
+                images = lp.get("images") or []
+                seen_urls = set()
+                if images:
+                    for img in images[:5]:                       # 캐러셀당 최대 5장
+                        if not isinstance(img, str) or img in seen_urls:
+                            continue
+                        seen_urls.add(img)
+                        feed_items.append({"image_url": img, "post_url": p_url})
+                        total_imgs += 1
+                        if total_imgs >= 8:
+                            break
+                else:
+                    img_url = lp.get("displayUrl") or lp.get("imageUrl") or ""
+                    if img_url:
+                        feed_items.append({"image_url": img_url, "post_url": p_url})
+                        total_imgs += 1
             profile_url = p.get("profilePicUrl") or p.get("profilePicUrlHD", "")
             if story_urls or feed_items or profile_url:
                 candidates.append({
