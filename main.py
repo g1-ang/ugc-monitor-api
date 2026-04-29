@@ -112,6 +112,60 @@ PROMPT_PROFILE_TEMPLATE = """원본 AI 프롬프트 (이 프롬프트로 [이미
 
 확신 안 서면 NO. 반드시 YES 또는 NO 한 단어만 답하세요."""
 
+
+# ── 관대 모드 (변형/유지형 프롬프트용) ───────────────
+# 헤어/의상/얼굴/배경은 유저 인풋이라 다양함 → 매치 판단에 무시
+# 핵심 시그니처(소품·포즈·색감 등)만 명확히 보이면 YES
+
+PROMPT_FEED_LENIENT_TEMPLATE = """원본 AI 프롬프트 (변형/유지형):
+═══════════════════════════════════════════════════════
+{prompt_text}
+═══════════════════════════════════════════════════════
+
+⚠️ 이 프롬프트는 일부 요소를 유저 인풋 이미지에서 그대로 가져옴.
+   따라서 **헤어, 의상, 얼굴 형태, 배경**은 유저별로 다양함 (그게 정상).
+   매치 판단에 헤어/의상/얼굴/배경 차이는 사용하지 마세요.
+
+[이미지 1]: 위 프롬프트로 생성된 레퍼런스
+[이미지 2]: 유저가 올린 판별 대상 피드 게시물
+
+**핵심 질문**: [이미지 2]가 위 AI 프롬프트가 명시적으로 추가한 **핵심 시그니처 요소**를 가지고 있나요?
+
+판별 원칙:
+1. 프롬프트가 명시한 **핵심 시그니처** (예: 특정 소품·디바이스·포즈·구도·색감/조명)가
+   [이미지 2]에 명확히 보이면 → YES
+2. **유지 요소(헤어, 의상, 얼굴, 배경)**의 차이는 무시 — 어차피 유저별로 다름
+3. 의심스러우면 NO. 하지만 "헤어 다르니까 NO" 같은 판단은 하지 마세요
+
+**자주 오판하는 케이스 (관대 모드에서도 NO)**:
+- 핵심 시그니처가 전혀 없음 (예: 프롬프트에 "디카" 명시인데 [이미지 2]에 디카 없음)
+- 단순한 셀카/AI풍이라는 표면적 공통점만
+- 핵심 시그니처와 무관한 이미지
+
+확신 안 서면 NO. 핵심 시그니처에 집중. 반드시 YES 또는 NO 한 단어만 답하세요."""
+
+PROMPT_PROFILE_LENIENT_TEMPLATE = """원본 AI 프롬프트 (변형/유지형):
+═══════════════════════════════════════════════════════
+{prompt_text}
+═══════════════════════════════════════════════════════
+
+⚠️ 이 프롬프트는 유저 인풋 이미지의 헤어/의상/얼굴/배경을 그대로 유지함.
+   매치 판단에 헤어/의상/얼굴/배경 차이는 사용하지 마세요.
+
+[이미지 1]: 위 프롬프트로 생성된 레퍼런스 (고화질)
+[이미지 2]: 유저의 프로필 사진 또는 스토리 (저해상도)
+
+**핵심 질문**: 작은 썸네일이지만 [이미지 2]에 위 프롬프트의 핵심 시그니처 요소가 보이나요?
+
+판별 원칙:
+1. 프롬프트의 **핵심 시그니처 요소** (특정 소품/디바이스/포즈/색감) 1-2개라도
+   저해상도에서 명확히 보이면 → YES
+2. 헤어/의상/얼굴 다른 건 무시 (변형/유지형이라 그게 정상)
+3. **저해상도라 핵심 시그니처도 안 보이면** → NO
+
+핵심 시그니처에만 집중. 반드시 YES 또는 NO 한 단어만 답하세요."""
+
+
 app = FastAPI(title="UGC Monitor API")
 
 app.add_middleware(
@@ -341,10 +395,17 @@ def run_apify(actor_id: str, run_input: dict, timeout: int = 200) -> list:
 
 # ── NAVER Open Models (Qwen2.5-VL) 판별 ───────
 def call_model_single(reference_data_uri: str, target_url: str, img_type: str = "feed",
-                      prompt_text: str = "", max_retries: int = 5) -> bool | None:
+                      prompt_text: str = "", max_retries: int = 5,
+                      lenient_mode: bool = False) -> bool | None:
     """1개 레퍼런스 vs 1개 타겟 비교 (Gemini 2.0 Flash via NAMC Vertex AI).
-    prompt_text가 있으면 원본 AI 프롬프트를 함께 전달 (하이브리드 판별)."""
-    template = PROMPT_PROFILE_TEMPLATE if img_type in ("profile", "story") else PROMPT_FEED_TEMPLATE
+    prompt_text가 있으면 원본 AI 프롬프트를 함께 전달 (하이브리드 판별).
+    lenient_mode=True 면 변형/유지형 프롬프트용 관대 템플릿 사용."""
+    if lenient_mode:
+        template = (PROMPT_PROFILE_LENIENT_TEMPLATE if img_type in ("profile", "story")
+                    else PROMPT_FEED_LENIENT_TEMPLATE)
+    else:
+        template = (PROMPT_PROFILE_TEMPLATE if img_type in ("profile", "story")
+                    else PROMPT_FEED_TEMPLATE)
     prompt = template.format(prompt_text=prompt_text or "(프롬프트 텍스트 없음 — 이미지 비교만 수행)")
     target = target_to_qwen_url(target_url)
     if not target:
@@ -426,35 +487,41 @@ def strip_format_constraints(prompt_text: str) -> str:
 
 
 def call_qwen(reference_data_uris: list, target_url: str, img_type: str = "feed",
-              prompt_text: str = "") -> bool:
+              prompt_text: str = "", lenient_mode: bool = False) -> bool:
     """다수의 레퍼런스 vs 1개 타겟 — 각 ref마다 별도 호출 후 다수결로 매치 결정.
-    2-pass 전략: strict(원본 프롬프트) NO 이면 relaxed(format 제약 제거) 로 재시도.
-    → 프롬프트에 "2-분할" 등이 있어도 1-분할 크롭을 올린 유저를 잡음.
+
+    동작 모드:
+      - lenient_mode=False (기본): 엄격 + 2-pass strict→relaxed (format 제약 자동 제거)
+      - lenient_mode=True (변형/유지형): 관대 템플릿 + 1장 이상 YES 면 통과 (permissive)
 
     이름은 후방 호환을 위해 call_qwen 유지하지만 실제로는 Gemini 2.0 Flash 사용."""
     if not reference_data_uris:
         return False
 
-    def _vote(pt: str, permissive: bool = False) -> bool:
+    def _vote(pt: str, permissive: bool, use_lenient_template: bool) -> bool:
         """permissive=False → 다수결(엄격). True → 1장 이상 YES 면 통과(완화)."""
         with ThreadPoolExecutor(max_workers=len(reference_data_uris)) as ex:
-            futs = [ex.submit(call_model_single, ru, target_url, img_type, pt)
+            futs = [ex.submit(call_model_single, ru, target_url, img_type, pt, 5,
+                              use_lenient_template)
                     for ru in reference_data_uris]
             results = [f.result() for f in as_completed(futs)]
         yes_count = sum(1 for r in results if r is True)
         threshold = 1 if permissive else max(1, (len(reference_data_uris) + 1) // 2)
         return yes_count >= threshold
 
-    # Pass 1: strict (원본 프롬프트 + 다수결)
-    if _vote(prompt_text, permissive=False):
+    # 관대 모드: 단일 pass + 관대 템플릿 + permissive(1/3)
+    if lenient_mode:
+        return _vote(prompt_text, permissive=True, use_lenient_template=True)
+
+    # 일반 모드: Pass 1 strict (원본 프롬프트 + 다수결)
+    if _vote(prompt_text, permissive=False, use_lenient_template=False):
         return True
 
     # Pass 2: format 제약 있는 프롬프트라면 relaxed + permissive(1장 이상 YES)
-    # → 2-분할 원본 ref 여러 장 + 1-분할 crop ref 1~2장 섞여 있어도 1-분할 유저 잡힘
-    # → FP 위험은 늘지만 어차피 휴먼 검수로 최종 판정
     if has_format_constraint(prompt_text):
         relaxed = strip_format_constraints(prompt_text)
-        if relaxed and relaxed != prompt_text and _vote(relaxed, permissive=True):
+        if relaxed and relaxed != prompt_text and _vote(relaxed, permissive=True,
+                                                        use_lenient_template=False):
             return True
 
     return False
@@ -601,7 +668,7 @@ def parse_comment_file(content: bytes, filename: str) -> list[str]:
 def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                   reference_data_uris: list, post_url: str = "",
                   prompt_text: str = "", campaign_name: str = "",
-                  reviewer: str = ""):
+                  reviewer: str = "", lenient_mode: bool = False):
     global scan_state
     scan_state.update({
         "status": "running", "progress": 5, "step": "댓글 파일 파싱 중...",
@@ -756,7 +823,8 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                 if img_type in found:
                     # 이미 이 타입에서 매치 잡음 — 나머지 이미지는 스캔 생략 (비용 절약)
                     continue
-                is_match = call_qwen(reference_data_uris, img_url, img_type, prompt_text)
+                is_match = call_qwen(reference_data_uris, img_url, img_type,
+                                     prompt_text, lenient_mode)
                 with phase3_lock:
                     s = phase3_stats[img_type]
                     s["scanned"] += 1
@@ -947,6 +1015,7 @@ async def start_scan(
     prompt_text: str = Form(""),
     campaign_name: str = Form(""),
     reviewer: str = Form(""),
+    lenient_mode: str = Form("false"),
     reference_image_1: Optional[UploadFile] = File(None),
     reference_image_2: Optional[UploadFile] = File(None),
     reference_image_3: Optional[UploadFile] = File(None),
@@ -985,11 +1054,15 @@ async def start_scan(
                   "gemini_api_calls": 0},
     })
 
+    is_lenient = lenient_mode.lower() in ("true", "1", "yes", "on")
+
     background_tasks.add_task(run_full_scan, comment_bytes, filename, ref_uris,
-                              post_url, prompt_text, campaign_name, reviewer)
+                              post_url, prompt_text, campaign_name, reviewer,
+                              is_lenient)
     return {"status": "started", "filename": filename, "ref_count": len(ref_uris),
             "post_url": post_url, "prompt_chars": len(prompt_text),
-            "campaign_name": campaign_name, "reviewer": reviewer}
+            "campaign_name": campaign_name, "reviewer": reviewer,
+            "lenient_mode": is_lenient}
 
 
 @app.get("/results")
