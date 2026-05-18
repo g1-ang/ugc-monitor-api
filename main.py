@@ -738,12 +738,14 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
             if uname:
                 profile_map[uname.lower()] = p
 
-        # ── Phase 2b: 스토리 스캔 (hasPublicStory 유저만) ──
-        story_users = [u for u in usernames
-                       if profile_map.get(u.lower(), {}).get("hasPublicStory", False)]
+        # ── Phase 2b: 스토리 스캔 ──
+        # 주의: Apify 프로필 스크레이퍼의 hasPublicStory 필드는 신뢰 못함 (false 인데 실제론 있음).
+        # 그래서 모든 유저 대상 — 스토리 없으면 스크레이퍼가 자동으로 빈 응답 반환.
+        # 비공개 유저는 어차피 프로필 스캔에서 빠지므로 profile_map 키만 사용.
+        story_users = [u for u in usernames if u.lower() in profile_map]
         scan_state.update({
             "progress": 62,
-            "step": f"스토리 스캔 중... ({len(story_users)}명 활성 스토리)",
+            "step": f"스토리 스캔 중... ({len(story_users)}명)",
         })
         story_map = {}
         story_chunks = [story_users[i:i+20] for i in range(0, len(story_users), 20)]
