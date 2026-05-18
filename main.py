@@ -748,7 +748,8 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
             "step": f"스토리 스캔 중... ({len(story_users)}명)",
         })
         story_map = {}
-        story_chunks = [story_users[i:i+20] for i in range(0, len(story_users), 20)]
+        # seemuapps 스토리 스크레이퍼는 batch 당 최대 5명 (API 제약)
+        story_chunks = [story_users[i:i+5] for i in range(0, len(story_users), 5)]
         for idx, chunk in enumerate(story_chunks):
             try:
                 items = run_apify(ACTOR_STORY, {"usernames": chunk}, timeout=180)
@@ -761,7 +762,7 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
             except Exception as e:
                 print(f"story batch {idx+1} 실패: {e}")
             if idx < len(story_chunks) - 1:
-                time.sleep(2)
+                time.sleep(1)  # batch 작아져서 더 자주 호출 — sleep 줄임
 
         # 판별 후보 구성
         # - 핀(isPinned)된 게시글 제외 → 진짜 최신만
