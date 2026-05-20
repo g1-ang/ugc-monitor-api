@@ -765,21 +765,22 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                 time.sleep(1)  # batch 작아져서 더 자주 호출 — sleep 줄임
 
         # 판별 후보 구성
-        # - 핀(isPinned)된 게시글 제외 → 진짜 최신만
-        # - timestamp 내림차순 정렬 (최신부터)
+        # - timestamp 내림차순 상위 3개 (핀 여부 무관)
+        #   → 유저가 캠페인 게시물을 핀으로 고정한 경우도 잡힘
+        #   → 오래된 핀(인사글 등)은 시간순으로 밀려서 자동 제외
         # - 캐러셀(Sidecar)이면 images[] 전체 포함 → 디카샷이 2/3번째여도 잡힘
         # - 유저당 최대 20장 (캐러셀이 너무 길면 비용 폭증 방지)
         candidates = []
         for uname, p in profile_map.items():
             story_urls = story_map.get(uname.lower(), [])         # 전체
             latest_posts = p.get("latestPosts") or p.get("posts") or []
-            # 1. 핀 제외 + 최신순 정렬
-            non_pinned = [lp for lp in latest_posts if not lp.get("isPinned")]
-            non_pinned.sort(key=lambda lp: lp.get("timestamp", ""), reverse=True)
+            # 시간순 정렬 (핀 포함) → 최신 3개
+            sorted_posts = sorted(latest_posts,
+                                  key=lambda lp: lp.get("timestamp", ""), reverse=True)
 
             feed_items = []
             total_imgs = 0
-            for lp in non_pinned[:3]:                            # 최신 3개 게시글
+            for lp in sorted_posts[:3]:                          # 최신 3개 게시글 (핀 포함)
                 if total_imgs >= 20:
                     break
                 sc    = lp.get("shortCode") or lp.get("shortcode") or ""
