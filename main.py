@@ -752,7 +752,7 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
         story_chunks = [story_users[i:i+5] for i in range(0, len(story_users), 5)]
         for idx, chunk in enumerate(story_chunks):
             try:
-                items = run_apify(ACTOR_STORY, {"usernames": chunk}, timeout=180)
+                items = run_apify(ACTOR_STORY, {"usernames": chunk, "_triggeredBy": "지원", "_project": "프롬프트 오가닉 모니터링"}, timeout=180)
                 for it in items:
                     u = (it.get("username") or "").lower()
                     stories = it.get("stories") or []
