@@ -756,7 +756,9 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                 for it in items:
                     u = (it.get("username") or "").lower()
                     stories = it.get("stories") or []
-                    urls = [s.get("mediaUrl") for s in stories if s.get("mediaUrl")]
+                    # mediaType=="image" 만 사용. 비디오는 Gemini Vision 처리 불가 → 무조건 NO 됨.
+                    urls = [s.get("mediaUrl") for s in stories
+                            if s.get("mediaUrl") and s.get("mediaType") == "image"]
                     if u and urls:
                         story_map[u] = urls
             except Exception as e:
