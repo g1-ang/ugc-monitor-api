@@ -516,18 +516,26 @@ def call_qwen(reference_data_uris: list, target_url: str, img_type: str = "feed"
         threshold = 1 if permissive else max(1, (len(reference_data_uris) + 1) // 2)
         return yes_count >= threshold
 
-    # 관대 모드 + 피드만: 헤어/의상 차이가 큰 변형/유지형은 피드에 적용해야 효과
-    # (프사·스토리는 저해상도 + 다른 사람 사진이라 lenient 적용 시 false positive 폭증)
-    if lenient_mode and img_type == "feed":
-        pt = prompt_text
-        if has_format_constraint(pt):
-            stripped = strip_format_constraints(pt)
-            if stripped:
-                pt = stripped
+    # 관대 모드 적용 정책 (재정의 2026-05-21):
+    # - 피드: strict (composed shot, 정밀 판별이 가능하므로 엄격)
+    # - 프사/스토리: 관대 (프사=저해상도, 스토리=캐주얼/2분할 등 변형 多 → permissive 필요)
+    # lenient_mode toggle 켜져있을 때만 적용. 기본은 모두 strict.
+    pt = prompt_text
+    if has_format_constraint(pt):
+        stripped = strip_format_constraints(pt)
+        if stripped:
+            pt = stripped
+
+    if lenient_mode and img_type in ("profile", "story"):
+        # 프사/스토리는 관대 — lenient 템플릿 + 1장 이상 YES면 통과
         return _vote(pt, permissive=True, use_lenient_template=True)
 
-    # 그 외 (lenient_mode + 프사/스토리는 여기로 떨어짐 → 일반 모드 유지)
-    # Pass 1: strict (원본 프롬프트 + 다수결)
+    if lenient_mode and img_type == "feed":
+        # 피드 관대 모드는 그대로 유지 (변형/유지형 프롬프트 대응)
+        return _vote(pt, permissive=True, use_lenient_template=True)
+
+    # strict 모드 (기본)
+    # Pass 1: 원본 프롬프트 + 다수결
     if _vote(prompt_text, permissive=False, use_lenient_template=False):
         return True
 
