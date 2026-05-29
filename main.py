@@ -630,6 +630,31 @@ def clip_matches(ref_embs, target_url: str, img_type: str) -> bool:
 
 
 # ── 스캔 히스토리 저장 ─────────────────────────
+SCAN_HISTORY_HEADER = [
+    "날짜", "캠페인", "게시물URL",
+    "피드", "스토리", "프사", "총계", "유저목록",          # 감지 (Gemini YES)
+    "실행자",
+    "확정피드", "확정스토리", "확정프사", "확정총계", "확정유저목록",  # 검수자 approved
+]
+
+
+def _ensure_history_header(ws):
+    """헤더가 구버전(9 컬럼)이면 확정 카운트 4 컬럼 자동 추가."""
+    header = ws.row_values(1)
+    if len(header) >= len(SCAN_HISTORY_HEADER) and header[:len(SCAN_HISTORY_HEADER)] == SCAN_HISTORY_HEADER:
+        return
+    # 부족한 컬럼 채워서 SCAN_HISTORY_HEADER 와 맞춤
+    updates = []
+    for i, name in enumerate(SCAN_HISTORY_HEADER, start=1):
+        if i > len(header) or header[i - 1] != name:
+            updates.append({
+                "range": f"'{HISTORY_TAB_NAME}'!{gspread.utils.rowcol_to_a1(1, i)}",
+                "values": [[name]],
+            })
+    if updates:
+        ws.spreadsheet.values_batch_update({"valueInputOption": "RAW", "data": updates})
+
+
 def save_scan_history(post_url: str, stats: dict, confirmed: list,
                       campaign_name: str = "", reviewer: str = ""):
     try:
@@ -641,25 +666,78 @@ def save_scan_history(post_url: str, stats: dict, confirmed: list,
         ss = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
         try:
             ws = ss.worksheet(HISTORY_TAB_NAME)
-            header = ws.row_values(1)
-            if "캠페인" not in header:
-                ws.update_cell(1, 2, "캠페인")
-            if "실행자" not in header:
-                # 새 컬럼 추가 (9번째 자리)
-                ws.update_cell(1, 9, "실행자")
+            _ensure_history_header(ws)
         except gspread.WorksheetNotFound:
-            ws = ss.add_worksheet(HISTORY_TAB_NAME, rows=1000, cols=9)
-            ws.append_row(["날짜", "캠페인", "게시물URL", "피드", "스토리", "프사", "총계", "유저목록", "실행자"],
-                          value_input_option="RAW")
+            ws = ss.add_worksheet(HISTORY_TAB_NAME, rows=1000, cols=len(SCAN_HISTORY_HEADER))
+            ws.append_row(SCAN_HISTORY_HEADER, value_input_option="RAW")
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         usernames = ",".join(r["username"] for r in confirmed)
+        # 감지 row 저장 — 확정 카운트는 0으로 초기화 (검수 시 _update_scan_history_confirm 으로 채워짐)
         ws.append_row([
             now, campaign_name, post_url,
             stats.get("feed", 0), stats.get("story", 0), stats.get("profile", 0),
             len(confirmed), usernames, reviewer,
+            0, 0, 0, 0, "",
         ], value_input_option="RAW")
     except Exception as e:
         print(f"⚠️ 히스토리 저장 실패: {e}")
+
+
+def _update_scan_history_confirm(campaign: str, post_url: str, approved_results: list):
+    """검수 결정 직후 호출 — scan_history 의 해당 캠페인+post_url 최신 row 의
+    확정 카운트(확정피드/확정스토리/확정프사/확정총계/확정유저목록)를 다시 계산해서 덮어쓰기.
+    백그라운드 호출용 — 실패해도 사용자에게 영향 X."""
+    if not campaign or not post_url:
+        return
+    try:
+        creds = Credentials.from_service_account_file(
+            GOOGLE_CREDENTIALS,
+            scopes=["https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"],
+        )
+        ss = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+        try:
+            ws = ss.worksheet(HISTORY_TAB_NAME)
+        except gspread.WorksheetNotFound:
+            return
+        _ensure_history_header(ws)
+        rows = ws.get_all_values()
+        if len(rows) < 2:
+            return
+        header = rows[0]
+        try:
+            camp_col = header.index("캠페인")
+            url_col  = header.index("게시물URL")
+            cf_col   = header.index("확정피드")     + 1  # 1-based
+            cs_col   = header.index("확정스토리")   + 1
+            cp_col   = header.index("확정프사")     + 1
+            ct_col   = header.index("확정총계")     + 1
+            cu_col   = header.index("확정유저목록") + 1
+        except ValueError:
+            return  # 헤더 컬럼 누락 — 다음 스캔 시 _ensure_header 가 보정
+        # 가장 최근 매칭 row 찾기 (아래에서 위로)
+        target_row = None
+        for i in range(len(rows) - 1, 0, -1):
+            r = rows[i]
+            if len(r) > max(camp_col, url_col) and r[camp_col] == campaign and r[url_col] == post_url:
+                target_row = i + 1  # 1-based 행 번호
+                break
+        if not target_row:
+            return
+        n_feed    = sum(1 for r in approved_results if r.get("type") == "feed")
+        n_story   = sum(1 for r in approved_results if r.get("type") == "story")
+        n_profile = sum(1 for r in approved_results if r.get("type") == "profile")
+        unames    = ",".join(r["username"] for r in approved_results)
+        updates = [
+            {"range": f"'{HISTORY_TAB_NAME}'!{gspread.utils.rowcol_to_a1(target_row, cf_col)}", "values": [[n_feed]]},
+            {"range": f"'{HISTORY_TAB_NAME}'!{gspread.utils.rowcol_to_a1(target_row, cs_col)}", "values": [[n_story]]},
+            {"range": f"'{HISTORY_TAB_NAME}'!{gspread.utils.rowcol_to_a1(target_row, cp_col)}", "values": [[n_profile]]},
+            {"range": f"'{HISTORY_TAB_NAME}'!{gspread.utils.rowcol_to_a1(target_row, ct_col)}", "values": [[len(approved_results)]]},
+            {"range": f"'{HISTORY_TAB_NAME}'!{gspread.utils.rowcol_to_a1(target_row, cu_col)}", "values": [[unames]]},
+        ]
+        ss.values_batch_update({"valueInputOption": "RAW", "data": updates})
+    except Exception as e:
+        print(f"⚠️ scan_history 확정 카운트 업데이트 실패 ({campaign}/{post_url}): {e}")
 
 
 # ── 전체 스캔 파이프라인 ───────────────────────
@@ -1240,9 +1318,14 @@ def review_decide(background_tasks: BackgroundTasks,
 
     # phase3_matched 탭 자동 upsert (백그라운드 — 사용자는 즉시 응답 받음)
     campaign = scan_state.get("campaign_name", "") or ""
+    post_url = scan_state.get("post_url", "") or ""
     background_tasks.add_task(_phase3_matched_upsert,
                               username, hit.get("type", ""), hit.get("link", "") or "",
                               campaign, reviewer, decision)
+
+    # scan_history 의 확정 카운트도 즉시 업데이트 (현재 scan_state 의 approved 전체 기준)
+    approved_now = [r for r in scan_state.get("results", []) if r.get("status") == "approved"]
+    background_tasks.add_task(_update_scan_history_confirm, campaign, post_url, approved_now)
 
     return {"ok": True, "username": username, "type": hit.get("type", ""),
             "decision": decision, "reviewer": reviewer,
@@ -1397,48 +1480,14 @@ def review_export():
         if new_rows:
             ws.append_rows(new_rows, value_input_option="RAW")
 
-        # ── scan_history 에서 이 스캔 row 를 찾아 '확정 기준' 으로 업데이트 ──
-        history_updated = False
+        # scan_history 확정 카운트 즉시 동기화 (공통 헬퍼 사용 — 감지 카운트는 보존)
+        post_url = scan_state.get("post_url", "")
         try:
-            ws_hist = ss.worksheet(HISTORY_TAB_NAME)
-            hist_rows = ws_hist.get_all_values()
-            if len(hist_rows) > 1:
-                header = hist_rows[0]
-                def col(name, default):  # 1-based 컬럼 번호 탐색 (없으면 default)
-                    return (header.index(name) + 1) if name in header else default
-                camp_col = col("캠페인", 2)
-                url_col  = col("게시물URL", 3)
-                feed_col, story_col, profile_col, total_col, users_col = (
-                    col("피드", 4), col("스토리", 5), col("프사", 6),
-                    col("총계", 7), col("유저목록", 8))
-                # 같은 캠페인 + 같은 post_url 가장 최신 row
-                post_url = scan_state.get("post_url", "")
-                target_row = None
-                for i in range(len(hist_rows) - 1, 0, -1):
-                    row = hist_rows[i]
-                    if (row[camp_col - 1] == campaign and
-                        row[url_col - 1] == post_url):
-                        target_row = i + 1  # 1-based (헤더 포함)
-                        break
-                if target_row:
-                    n_feed    = sum(1 for r in approved if r.get("type") == "feed")
-                    n_story   = sum(1 for r in approved if r.get("type") == "story")
-                    n_profile = sum(1 for r in approved if r.get("type") == "profile")
-                    n_total   = len(approved)
-                    unames    = ",".join(r["username"] for r in approved)
-                    updates = []
-                    def _cell(col_num, value):
-                        a1 = gspread.utils.rowcol_to_a1(target_row, col_num)
-                        updates.append({"range": f"'{HISTORY_TAB_NAME}'!{a1}", "values": [[value]]})
-                    _cell(feed_col,    n_feed)
-                    _cell(story_col,   n_story)
-                    _cell(profile_col, n_profile)
-                    _cell(total_col,   n_total)
-                    _cell(users_col,   unames)
-                    ss.values_batch_update({"valueInputOption": "RAW", "data": updates})
-                    history_updated = True
+            _update_scan_history_confirm(campaign, post_url, approved)
+            history_updated = True
         except Exception as e:
             print(f"⚠️ scan_history 확정 업데이트 실패: {e}")
+            history_updated = False
 
         return {"exported": len(new_rows), "skipped_duplicates": len(approved) - len(new_rows),
                 "tab": PHASE3_MATCHED_TAB, "history_updated": history_updated}
