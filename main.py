@@ -51,7 +51,7 @@ HISTORY_TAB_NAME   = "scan_history"
 APIFY_BASE     = "https://api.apify.com/v2"
 ACTOR_PROFILE  = "apify~instagram-profile-scraper"
 ACTOR_STORY    = "seemuapps~instagram-story-scraper"
-USERNAME_HEADERS = {"username", "user", "userid", "user_id", "아이디", "id"}
+USERNAME_HEADERS = {"username", "user", "userid", "user_id", "아이디", "id", "작성자", "작성자id", "작성자아이디"}
 MODEL_NAME     = "gemini-2.0-flash"  # Gemini 2.0 Flash via NAMC Vertex AI
 API_SEMAPHORE  = threading.Semaphore(10)  # 글로벌 API 호출 동시 한도 (429 뜨면 낮춰야 함)
 
