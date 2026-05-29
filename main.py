@@ -639,20 +639,17 @@ SCAN_HISTORY_HEADER = [
 
 
 def _ensure_history_header(ws):
-    """헤더가 구버전(9 컬럼)이면 확정 카운트 4 컬럼 자동 추가."""
+    """헤더가 구버전이면 확정 카운트 컬럼 자동 추가. 시트 grid 가 좁으면 컬럼도 확장."""
     header = ws.row_values(1)
     if len(header) >= len(SCAN_HISTORY_HEADER) and header[:len(SCAN_HISTORY_HEADER)] == SCAN_HISTORY_HEADER:
         return
-    # 부족한 컬럼 채워서 SCAN_HISTORY_HEADER 와 맞춤
-    updates = []
-    for i, name in enumerate(SCAN_HISTORY_HEADER, start=1):
-        if i > len(header) or header[i - 1] != name:
-            updates.append({
-                "range": f"'{HISTORY_TAB_NAME}'!{gspread.utils.rowcol_to_a1(1, i)}",
-                "values": [[name]],
-            })
-    if updates:
-        ws.spreadsheet.values_batch_update({"valueInputOption": "RAW", "data": updates})
+    # 1) 시트 grid 컬럼 부족하면 add_cols 로 확장
+    need = len(SCAN_HISTORY_HEADER) - ws.col_count
+    if need > 0:
+        ws.add_cols(need)
+    # 2) 헤더 행 한 번에 덮어쓰기 (14 컬럼)
+    last_col = gspread.utils.rowcol_to_a1(1, len(SCAN_HISTORY_HEADER))
+    ws.update(f"A1:{last_col}", [SCAN_HISTORY_HEADER], value_input_option="RAW")
 
 
 def save_scan_history(post_url: str, stats: dict, confirmed: list,
