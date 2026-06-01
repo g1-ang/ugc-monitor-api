@@ -53,7 +53,7 @@ ACTOR_PROFILE  = "apify~instagram-profile-scraper"
 ACTOR_STORY    = "seemuapps~instagram-story-scraper"
 USERNAME_HEADERS = {"username", "user", "userid", "user_id", "아이디", "id", "작성자", "작성자id", "작성자아이디"}
 MODEL_NAME     = "gemini-2.0-flash"  # Gemini 2.0 Flash via NAMC Vertex AI
-API_SEMAPHORE  = threading.Semaphore(10)  # 글로벌 API 호출 동시 한도 (429 뜨면 낮춰야 함)
+API_SEMAPHORE  = threading.Semaphore(14)  # 글로벌 NAMC API 동시 한도 (429 뜨면 낮춰야 함)
 
 PROMPT_FEED_TEMPLATE = """원본 AI 프롬프트 (이 프롬프트로 [이미지 1] 레퍼런스가 만들어짐):
 ═══════════════════════════════════════════════════════
@@ -833,20 +833,32 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
         story_map = {}
         # seemuapps 스토리 스크레이퍼는 batch 당 최대 5명 (API 제약)
         story_chunks = [story_users[i:i+5] for i in range(0, len(story_users), 5)]
-        for idx, chunk in enumerate(story_chunks):
+        # 병렬 처리 (5개 배치 동시 = 25명 동시) — Apify 동시 run 한도 25 안 넘기게
+        story_lock = threading.Lock()
+
+        def _scan_story_chunk(idx_chunk):
+            idx, chunk = idx_chunk
             try:
-                items = run_apify(ACTOR_STORY, {"usernames": chunk, "_triggeredBy": "지원", "_project": "프롬프트 오가닉 모니터링"}, timeout=180)
+                items = run_apify(ACTOR_STORY,
+                                  {"usernames": chunk, "_triggeredBy": "지원",
+                                   "_project": "프롬프트 오가닉 모니터링"},
+                                  timeout=180)
                 for it in items:
                     u = (it.get("username") or "").lower()
                     stories = it.get("stories") or []
-                    # 이미지/비디오 둘 다 포함. 비디오는 target_to_qwen_url() 에서 ffmpeg 으로 1프레임 추출.
                     urls = [s.get("mediaUrl") for s in stories if s.get("mediaUrl")]
                     if u and urls:
-                        story_map[u] = urls
+                        with story_lock:
+                            story_map[u] = urls
             except Exception as e:
                 print(f"story batch {idx+1} 실패: {e}")
-            if idx < len(story_chunks) - 1:
-                time.sleep(1)  # batch 작아져서 더 자주 호출 — sleep 줄임
+            # 진행률 마이크로 업데이트 (스토리 phase 안에서도 progress 미세 변화 표시)
+            with story_lock:
+                done = sum(1 for _ in story_map) if False else None  # noop placeholder
+            # 별도 카운터 갱신은 outer에서
+
+        with ThreadPoolExecutor(max_workers=5) as story_pool:
+            list(story_pool.map(_scan_story_chunk, enumerate(story_chunks)))
 
         # 판별 후보 구성
         # - timestamp 내림차순 상위 3개 (핀 여부 무관)
@@ -972,7 +984,7 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                     }
             return list(found.values())
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        with ThreadPoolExecutor(max_workers=16) as pool:
             futures = {pool.submit(detect_one, u): u for u in candidates}
             for future in as_completed(futures):
                 with done_lock:
