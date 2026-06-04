@@ -52,7 +52,7 @@ APIFY_BASE     = "https://api.apify.com/v2"
 ACTOR_PROFILE  = "apify~instagram-profile-scraper"
 ACTOR_STORY    = "seemuapps~instagram-story-scraper"
 USERNAME_HEADERS = {"username", "user", "userid", "user_id", "아이디", "id", "작성자", "작성자id", "작성자아이디"}
-MODEL_NAME     = "gemini-2.5-flash"  # Gemini 2.5 Flash via NAMC Vertex AI (2.0 deprecated)
+MODEL_NAME     = "gemini-3.1-flash-lite"  # Gemini 3.1 Flash Lite (GA, 영구). 2.5-flash 는 2026-06-17 종료.
 API_SEMAPHORE  = threading.Semaphore(14)  # 글로벌 NAMC API 동시 한도 (429 뜨면 낮춰야 함)
 
 PROMPT_FEED_TEMPLATE = """원본 AI 프롬프트 (이 프롬프트로 [이미지 1] 레퍼런스가 만들어짐):
@@ -443,7 +443,8 @@ def call_model_single(reference_data_uri: str, target_url: str, img_type: str = 
             ],
         }],
         "temperature": 0.1,
-        "max_tokens": 10,
+        # gemini-3.x reasoning 모델은 답 전에 reasoning 토큰을 100+ 씀 → 충분히 줘야 답이 나옴
+        "max_tokens": 200,
     }
     headers = {
         "Authorization": f"Bearer {NAVER_API_KEY}",
