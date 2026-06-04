@@ -378,7 +378,19 @@ def run_apify(actor_id: str, run_input: dict, timeout: int = 200) -> list:
     status_data = {}
     while time.time() < deadline:
         time.sleep(6)
-        r = requests.get(f"{APIFY_BASE}/actor-runs/{run_id}?token={APIFY_API_TOKEN}", timeout=15)
+        # 일시적 네트워크 흔들림은 재시도 (최대 3회). 그래도 실패하면 폴링만 한 사이클 건너뜀.
+        r = None
+        for attempt in range(3):
+            try:
+                r = requests.get(f"{APIFY_BASE}/actor-runs/{run_id}?token={APIFY_API_TOKEN}", timeout=30)
+                break
+            except (requests.Timeout, requests.ConnectionError) as e:
+                if attempt == 2:
+                    print(f"[apify] poll 실패 (재시도 소진): {e} — 다음 사이클 대기")
+                    break
+                time.sleep(2 ** attempt)
+        if r is None:
+            continue
         status_data = r.json()["data"]
         if status_data["status"] == "SUCCEEDED":
             break
