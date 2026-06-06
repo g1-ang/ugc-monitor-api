@@ -444,7 +444,7 @@ def call_model_single(reference_data_uri: str, target_url: str, img_type: str = 
         }],
         "temperature": 0.1,
         # gemini-3.x reasoning 모델은 답 전에 reasoning 토큰을 100+ 씀 → 충분히 줘야 답이 나옴
-        "max_tokens": 500,
+        "max_tokens": 200,
     }
     headers = {
         "Authorization": f"Bearer {NAVER_API_KEY}",
