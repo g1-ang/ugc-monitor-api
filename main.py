@@ -53,7 +53,7 @@ ACTOR_PROFILE  = "apify~instagram-profile-scraper"
 ACTOR_STORY    = "seemuapps~instagram-story-scraper"
 USERNAME_HEADERS = {"username", "user", "userid", "user_id", "아이디", "id", "작성자", "작성자id", "작성자아이디"}
 MODEL_NAME     = "gemini-3.1-flash-lite"  # Gemini 3.1 Flash Lite (GA, 영구). 2.5-flash 는 2026-06-17 종료.
-API_SEMAPHORE  = threading.Semaphore(14)  # 글로벌 NAMC API 동시 한도 (429 뜨면 낮춰야 함)
+API_SEMAPHORE  = threading.Semaphore(40)  # 글로벌 NAMC API 동시 한도 (NAMC 가이드: 응답 10s 기준 최대 50, 40 = 안전 마진)
 
 PROMPT_FEED_TEMPLATE = """원본 AI 프롬프트 (이 프롬프트로 [이미지 1] 레퍼런스가 만들어짐):
 ═══════════════════════════════════════════════════════
