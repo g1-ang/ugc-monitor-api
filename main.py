@@ -889,7 +889,7 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
 
             feed_items = []
             total_imgs = 0
-            for lp in sorted_posts[:3]:                          # 최신 3개 게시글 (핀 포함)
+            for lp in sorted_posts[:2]:                          # 최신 2개 게시글 (핀 포함) — 게시 다음날 검수 워크플로우 기준
                 if total_imgs >= 20:
                     break
                 sc    = lp.get("shortCode") or lp.get("shortcode") or ""
