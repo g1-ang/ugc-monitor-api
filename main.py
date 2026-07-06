@@ -459,6 +459,11 @@ def call_model_single(reference_data_uri: str, target_url: str, img_type: str = 
             if resp.status_code in (429, 503):
                 time.sleep(min(60, 2 ** (attempt + 2)))
                 continue
+            # 400: Vertex 가 타겟 이미지 URL 을 못 가져온 경우가 대부분 (인스타 CDN 서명 URL 만료).
+            #      재시도해도 동일하므로 응답 본문을 남기고 이 이미지는 스킵(None).
+            if resp.status_code == 400:
+                print(f"⚠️ NAMC 400 (타겟 이미지 취득 실패 추정=CDN 만료) type={img_type}: {resp.text[:180]}")
+                return None
             resp.raise_for_status()
             body = resp.json()
             answer = body["choices"][0]["message"]["content"].strip().upper()
@@ -1012,24 +1017,39 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
                 })
 
         # Sheets 일괄 업데이트 (완료 후 한 번에)
+        # ⚠️ 시트 저장이 네트워크 타임아웃으로 실패해도 판별 결과(confirmed)는 절대 유실되면 안 됨.
+        #    예외를 여기서 삼키고, 아래 scan_state / phase3_results.json 저장은 반드시 실행되게 한다.
+        #    (과거: 여기서 타임아웃 → 스캔 전체 error → 2시간 판별 결과 통째로 유실)
         if confirmed:
-            all_vals  = sheet.get_all_values()
-            row_index = {row[0].strip().lower(): i+2
-                         for i, row in enumerate(all_vals[1:]) if row and row[0]}
-            now_str   = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            batch     = []
-            for r in confirmed:
-                ri = row_index.get(r["username"].lower())
-                if ri:
-                    batch += [
-                        {"range": sheet_range(f"G{ri}"), "values": [["TRUE"]]},
-                        {"range": sheet_range(f"H{ri}"), "values": [[r["type"]]]},
-                        {"range": sheet_range(f"I{ri}"), "values": [[now_str]]},
-                    ]
-            if batch:
-                sheet.spreadsheet.values_batch_update(
-                    {"valueInputOption": "RAW", "data": batch}
-                )
+            try:
+                all_vals  = sheet.get_all_values()
+                row_index = {row[0].strip().lower(): i+2
+                             for i, row in enumerate(all_vals[1:]) if row and row[0]}
+                now_str   = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                batch     = []
+                for r in confirmed:
+                    ri = row_index.get(r["username"].lower())
+                    if ri:
+                        batch += [
+                            {"range": sheet_range(f"G{ri}"), "values": [["TRUE"]]},
+                            {"range": sheet_range(f"H{ri}"), "values": [[r["type"]]]},
+                            {"range": sheet_range(f"I{ri}"), "values": [[now_str]]},
+                        ]
+                if batch:
+                    for attempt in range(3):
+                        try:
+                            sheet.spreadsheet.values_batch_update(
+                                {"valueInputOption": "RAW", "data": batch}
+                            )
+                            break
+                        except Exception as e:
+                            if attempt == 2:
+                                raise
+                            print(f"⚠️ 시트 매치 업데이트 재시도 {attempt+1}/3: {str(e)[:120]}")
+                            time.sleep(2 ** attempt)
+            except Exception as e:
+                scan_state["sheet_write_error"] = str(e)[:200]
+                print(f"⚠️ 시트 매치 업데이트 실패 — 결과는 보존됨 (검수 화면/파일에서 확인 가능): {str(e)[:160]}")
 
         # ── 완료 ──────────────────────────────
         feed_n    = len([r for r in confirmed if r["type"] == "feed"])
@@ -1080,10 +1100,17 @@ def run_full_scan(comment_file_bytes: bytes, comment_filename: str,
         })
 
         # 같은 캠페인의 과거 검수 이력 자동 재적용 (이미 approved/rejected 된 것 반복 검수 방지)
-        _apply_previous_campaign_decisions(campaign_name)
+        # status=done 이 이미 세팅된 후이므로, 여기서 네트워크 오류가 나도 결과를 유실시키지 않는다.
+        try:
+            _apply_previous_campaign_decisions(campaign_name)
+        except Exception as e:
+            print(f"⚠️ 과거 검수 재적용 실패 (결과는 보존됨): {str(e)[:120]}")
 
         # 서버 재시작 대비: 스캔 결과를 phase3_results.json 에 영구 저장
-        _save_phase3_results_full()
+        try:
+            _save_phase3_results_full()
+        except Exception as e:
+            print(f"⚠️ phase3_results.json 저장 실패 (결과는 메모리에 보존됨): {str(e)[:120]}")
 
     except Exception as e:
         scan_state.update({"status": "error", "step": f"오류: {str(e)}"})
